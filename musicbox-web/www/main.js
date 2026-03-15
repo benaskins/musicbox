@@ -3,9 +3,81 @@ let workletNode = null;
 let analyser = null;
 let wasmBytes = null;
 let animFrameId = null;
+let dotAnimFrameId = null;
 
 const btn = document.getElementById("toggle");
 const status = document.getElementById("status");
+
+// ── Dot animation along circle arc ──
+const CX = 120, CY = 120, CR = 100;
+const TARGET_ANGLE = Math.PI / 2; // bottom of circle (SVG y-down)
+const DOT_MORPH_MS = 600; // slower than waveform morph for organic feel
+
+// Starting angles for the 4 outer dots (atan2 from center, SVG y-down)
+const DOT_START_ANGLES = [
+    Math.atan2(150.9 - CY, 24.9 - CX),   // ~2.827 rad (lower-left)
+    Math.atan2(39.1 - CY, 61.2 - CX),     // ~-2.200 rad (upper-left)
+    Math.atan2(39.1 - CY, 178.8 - CX),    // ~-0.942 rad (upper-right)
+    Math.atan2(150.9 - CY, 215.1 - CX),   // ~0.314 rad (lower-right)
+];
+
+// Compute shortest arc direction and distance to target for each dot
+const DOT_ARCS = DOT_START_ANGLES.map(start => {
+    let diff = TARGET_ANGLE - start;
+    // Normalize to [-π, π]
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    return diff; // signed arc distance
+});
+
+function easeInOutCubic(t) {
+    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+function setDotPositions(blend) {
+    // blend: 0 = home positions, 1 = all at bottom
+    const dots = document.querySelectorAll(".sigil-dot");
+    dots.forEach((dot, i) => {
+        const startAngle = DOT_START_ANGLES[i];
+        const arcDist = DOT_ARCS[i];
+        // Stagger: dots with longer arcs start moving first
+        const maxArc = Math.max(...DOT_ARCS.map(Math.abs));
+        const stagger = 1.0 - (Math.abs(arcDist) / maxArc) * 0.3;
+        const t = easeInOutCubic(Math.min(blend / stagger, 1.0));
+
+        const angle = startAngle + arcDist * t;
+        const x = CX + CR * Math.cos(angle);
+        const y = CY + CR * Math.sin(angle);
+        dot.setAttribute("cx", x.toFixed(1));
+        dot.setAttribute("cy", y.toFixed(1));
+    });
+}
+
+function animateDotsToBottom() {
+    const startTime = performance.now();
+    function step() {
+        const blend = Math.min((performance.now() - startTime) / DOT_MORPH_MS, 1.0);
+        setDotPositions(blend);
+        if (blend < 1.0) {
+            dotAnimFrameId = requestAnimationFrame(step);
+        }
+    }
+    step();
+}
+
+function animateDotsToHome() {
+    const startTime = performance.now();
+    // Capture current blend (should be 1.0 if fully coalesced)
+    function step() {
+        const elapsed = performance.now() - startTime;
+        const blend = 1.0 - Math.min(elapsed / DOT_MORPH_MS, 1.0);
+        setDotPositions(blend);
+        if (blend > 0.0) {
+            dotAnimFrameId = requestAnimationFrame(step);
+        }
+    }
+    step();
+}
 
 // Static path data for morph-back
 const SINE_PATH = "M 40 120 C 40 120, 50 74, 60 74 C 70 74, 80 120, 80 120 C 80 120, 90 166, 100 166 C 110 166, 120 120, 120 120 C 120 120, 130 74, 140 74 C 150 74, 160 120, 160 120 C 160 120, 170 166, 180 166 C 190 166, 200 120, 200 120";
@@ -77,6 +149,10 @@ function startVisualization() {
     morphStartTime = performance.now();
     morphDirection = 1;
 
+    // Animate dots to bottom
+    if (dotAnimFrameId) cancelAnimationFrame(dotAnimFrameId);
+    animateDotsToBottom();
+
     function draw() {
         animFrameId = requestAnimationFrame(draw);
         analyser.getByteTimeDomainData(dataArray);
@@ -109,6 +185,10 @@ function stopVisualization() {
 
     cancelAnimationFrame(animFrameId);
     animFrameId = null;
+
+    // Animate dots back to home positions
+    if (dotAnimFrameId) cancelAnimationFrame(dotAnimFrameId);
+    animateDotsToHome();
 
     const startTime = performance.now();
 
