@@ -1,10 +1,6 @@
-[package]
-name = "musicbox"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-cpal = "0.15"
-ctrlc = "3.4"
-hound = "3.5"
-rand = "0.8"
+[workspace]
+members = [
+    "musicbox-core",
+    "musicbox-cli",
+]
+resolver = "3"
