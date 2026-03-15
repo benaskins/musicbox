@@ -1,61 +1,306 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>musicbox</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            background: #111;
-            color: #ddd;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-        }
-        .container {
-            text-align: center;
-        }
-        h1 {
-            font-size: 1.5rem;
-            font-weight: 400;
-            margin-bottom: 2rem;
-            color: #888;
-        }
-        button {
-            font-size: 1.2rem;
-            padding: 0.8rem 2.5rem;
-            border: 1px solid #444;
-            border-radius: 4px;
-            background: #222;
-            color: #ddd;
-            cursor: pointer;
-            transition: background 0.15s, border-color 0.15s;
-        }
-        button:hover:not(:disabled) {
-            background: #333;
-            border-color: #666;
-        }
-        button:disabled {
-            opacity: 0.4;
-            cursor: default;
-        }
-        #status {
-            margin-top: 1.5rem;
-            font-size: 0.9rem;
-            color: #666;
-            min-height: 1.2em;
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>musicbox</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --ink: #1C1917;
+    --cream: #FAF9F7;
+    --rule: #E7E5E4;
+    --muted: #A8A29E;
+    --mid: #78716C;
+    --stone: #57534E;
+  }
+
+  .dark {
+    --ink: #FAF9F7;
+    --cream: #1C1917;
+    --rule: #2E2A27;
+    --muted: #A8A29E;
+    --mid: #D6D3D1;
+    --stone: #E7E5E4;
+  }
+
+  body {
+    background: var(--cream);
+    color: var(--ink);
+    font-family: 'DM Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    overflow-x: hidden;
+    transition: background 0.7s ease, color 0.7s ease;
+  }
+
+  .hero {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+    padding: 40px 24px;
+  }
+
+  .wordmark {
+    font-size: 32px;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    color: var(--ink);
+  }
+
+  .tagline {
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+  }
+
+  .lbl {
+    font-size: 9.5px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* ── PLAY CONTROL ── */
+
+  .play-container {
+    margin-top: 8px;
+  }
+
+  button {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    padding: 10px 32px;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--ink);
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  button:hover:not(:disabled) {
+    border-color: var(--ink);
+  }
+  button:disabled {
+    opacity: 0.3;
+    cursor: default;
+  }
+
+  #status {
+    margin-top: 16px;
+    font-size: 9.5px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    min-height: 1.2em;
+  }
+
+  /* ── ABOUT ── */
+
+  .divider {
+    max-width: 640px;
+    margin: 0 auto;
+    border: none;
+    border-top: 1px solid var(--rule);
+  }
+
+  section {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 80px 24px;
+  }
+
+  section p {
+    font-size: 16px;
+    font-weight: 400;
+    line-height: 1.7;
+    color: var(--mid);
+    margin-top: 16px;
+  }
+
+  section .socials {
+    display: flex;
+    gap: 16px;
+    margin-top: 24px;
+  }
+  section .socials a {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ink);
+    text-decoration: none;
+    letter-spacing: -0.01em;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 2px;
+    transition: border-color 0.2s;
+  }
+  section .socials a:hover { border-color: var(--ink); }
+
+  /* ── FOOTER ── */
+
+  footer {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+
+  /* ── SIGIL ── */
+
+  .sigil-container {
+    width: 180px;
+    height: 180px;
+    perspective: 800px;
+    cursor: pointer;
+  }
+
+  .sigil-inner {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    transform-style: preserve-3d;
+    transition: transform 0.7s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .sigil-inner.flipped { transform: rotateY(180deg); }
+
+  .sigil-face {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    backface-visibility: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .sigil-back { transform: rotateY(180deg); }
+
+  /* ── GENLEVEL LINK ── */
+
+  .genlevel-link {
+    font-size: 9.5px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+  .genlevel-link:hover { color: var(--ink); }
+
+  @media (max-width: 480px) {
+    .sigil-container { width: 150px; height: 150px; }
+    .wordmark { font-size: 26px; }
+    footer { flex-direction: column; gap: 8px; }
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .fade-in { animation: fadeUp 0.6s ease both; }
+</style>
 </head>
 <body>
-    <div class="container">
-        <h1>musicbox</h1>
-        <button id="toggle">Play</button>
-        <p id="status"></p>
+
+<!-- ── HERO ── -->
+<div class="hero">
+  <div class="sigil-container" onclick="this.querySelector('.sigil-inner').classList.toggle('flipped'); document.documentElement.classList.toggle('dark')">
+    <div class="sigil-inner">
+      <div class="sigil-face">
+        <svg width="180" height="180" viewBox="0 0 240 240">
+          <circle cx="120" cy="120" r="100" fill="none" stroke="currentColor" stroke-width="1.2"/>
+          <path d="M 120 20 A 100 100 0 0 1 206.6 170" fill="none" stroke="currentColor" stroke-width="0.3" opacity="0.25" stroke-dasharray="2 8"/>
+          <line x1="24" y1="120" x2="216" y2="120" stroke="currentColor" stroke-width="0.6" opacity="0.3"/>
+          <path d="M 40 120 C 40 120, 50 74, 60 74 C 70 74, 80 120, 80 120 C 80 120, 90 166, 100 166 C 110 166, 120 120, 120 120 C 120 120, 130 74, 140 74 C 150 74, 160 120, 160 120 C 160 120, 170 166, 180 166 C 190 166, 200 120, 200 120"
+                fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          <circle cx="40" cy="120" r="2.5" fill="currentColor"/>
+          <circle cx="120" cy="220" r="3" fill="currentColor"/>
+          <circle cx="24.9" cy="150.9" r="3" fill="currentColor"/>
+          <circle cx="61.2" cy="39.1" r="3" fill="currentColor"/>
+          <circle cx="178.8" cy="39.1" r="3" fill="currentColor"/>
+          <circle cx="215.1" cy="150.9" r="3" fill="currentColor"/>
+        </svg>
+      </div>
+      <div class="sigil-face sigil-back">
+        <svg width="180" height="180" viewBox="0 0 240 240">
+          <circle cx="120" cy="120" r="100" fill="none" stroke="currentColor" stroke-width="1.2"/>
+          <path d="M 120 20 A 100 100 0 0 1 206.6 170" fill="none" stroke="currentColor" stroke-width="0.3" opacity="0.25" stroke-dasharray="2 8"/>
+          <line x1="24" y1="120" x2="216" y2="120" stroke="currentColor" stroke-width="0.6" opacity="0.3"/>
+          <path d="M 40 120 L 48 89 L 56 145 L 62 78 L 70 153 L 78 95 L 88 162 L 96 83 L 104 148 L 112 74 L 118 139 L 126 92 L 134 166 L 140 80 L 150 151 L 158 90 L 164 133 L 172 74 L 182 146 L 190 98 L 200 120"
+                fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="40" cy="120" r="2.5" fill="currentColor"/>
+          <circle cx="120" cy="220" r="3" fill="currentColor"/>
+          <circle cx="24.9" cy="150.9" r="3" fill="currentColor"/>
+          <circle cx="61.2" cy="39.1" r="3" fill="currentColor"/>
+          <circle cx="178.8" cy="39.1" r="3" fill="currentColor"/>
+          <circle cx="215.1" cy="150.9" r="3" fill="currentColor"/>
+        </svg>
+      </div>
     </div>
-    <script src="main.js"></script>
+  </div>
+  <div class="wordmark">musicbox</div>
+  <div class="tagline">generative ambient audio</div>
+  <div class="play-container">
+    <button id="toggle">Play</button>
+  </div>
+  <p id="status"></p>
+  <a href="https://genlevel.com" class="genlevel-link">genlevel</a>
+</div>
+
+<!-- ── ABOUT ── -->
+<hr class="divider">
+<section class="fade-in">
+  <div class="lbl">About</div>
+  <p>A self-contained generative synthesizer written in Rust, compiled to WebAssembly. Four layers of evolving sound &mdash; slow bass drones, filtered mid-range oscillators, reverbed highs, and stochastic plucked strings &mdash; create a unique ambient soundscape on each play.</p>
+  <p>Every run is seeded randomly. No two listens are the same.</p>
+  <div class="socials">
+    <a href="https://github.com/benaskins/musicbox">Source</a>
+    <a href="https://genlevel.com">genlevel</a>
+  </div>
+</section>
+
+<!-- ── FOOTER ── -->
+<hr class="divider">
+<footer>
+  <div class="lbl">musicbox</div>
+  <div class="lbl">&copy; Benjamin Askins 2026</div>
+</footer>
+
+<script src="main.js"></script>
+
+<script>
+  // Fade-in on scroll
+  const obs = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.style.animationDelay = '0.1s';
+        e.target.classList.add('fade-in');
+        obs.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.1 });
+
+  document.querySelectorAll('section').forEach(s => {
+    s.classList.remove('fade-in');
+    s.style.opacity = '0';
+    obs.observe(s);
+  });
+
+  document.querySelectorAll('section').forEach(s => {
+    s.addEventListener('animationend', () => { s.style.opacity = '1'; });
+  });
+</script>
+
 </body>
 </html>
