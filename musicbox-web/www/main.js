@@ -219,7 +219,13 @@ async function start() {
     try {
         const bytes = await loadWasm();
 
-        audioCtx = new AudioContext({ sampleRate: 44100 });
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+        if (audioCtx.state === "suspended") {
+            await audioCtx.resume();
+        }
+        if (!audioCtx.audioWorklet) {
+            throw new Error("AudioWorklet not supported — try a modern browser over HTTPS");
+        }
         await audioCtx.audioWorklet.addModule("worklet.js");
 
         workletNode = new AudioWorkletNode(audioCtx, "musicbox-processor", {
