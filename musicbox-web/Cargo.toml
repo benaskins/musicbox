@@ -1,0 +1,12 @@
+[package]
+name = "musicbox-web"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+musicbox-core = { path = "../musicbox-core" }
+wasm-bindgen = "0.2"
+getrandom = { version = "0.2", features = ["js"] }

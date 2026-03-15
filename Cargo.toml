@@ -2,5 +2,6 @@
 members = [
     "musicbox-core",
     "musicbox-cli",
+    "musicbox-web",
 ]
 resolver = "3"

@@ -85,8 +85,26 @@ impl MusicBox {
 - Calls `musicbox.render()` in the cpal callback, then interleaves into cpal's buffer
 - Calls `musicbox.render()` in a loop for WAV rendering
 
-### Step 4: Verify
+### Step 4: Verify (DONE)
 
 - `cargo build --release` from workspace root
 - `cargo run -p musicbox-cli --release` produces identical audio behaviour
 - Render a WAV and confirm it sounds right
+
+### Step 5: Create musicbox-web WASM bridge
+
+- Add `musicbox-web` to workspace
+- `musicbox-web/Cargo.toml`: deps on `musicbox-core`, `wasm-bindgen`, `getrandom` with `js` feature
+- `musicbox-web/src/lib.rs`: `#[wasm_bindgen]` wrapper exposing `create(seed)`, `render(left, right)`, `start_fade_out()`, `is_done()`
+- Build with `wasm-pack build --target web`
+
+### Step 6: AudioWorklet processor + HTML host
+
+- `musicbox-web/www/worklet.js`: `AudioWorkletProcessor` that imports WASM, calls `render()` each frame
+- `musicbox-web/www/index.html`: minimal page with start/stop button, loads worklet
+- `musicbox-web/www/main.js`: creates `AudioContext`, registers worklet, handles start/stop
+
+### Step 7: Build and verify in browser
+
+- Build WASM with wasm-pack
+- Serve `www/` and confirm audio plays in browser
