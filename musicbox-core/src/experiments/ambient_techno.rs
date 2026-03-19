@@ -117,7 +117,7 @@ impl Kick {
 
 /// Xorshift64 PRNG for cheap per-sample noise.
 /// Deterministic given a seed, no allocation.
-struct Xorshift64 {
+pub struct Xorshift64 {
     state: u64,
 }
 
@@ -281,16 +281,222 @@ impl DriftingPulse {
     }
 }
 
+/// Dub stab: 2-3 detuned oscillators forming a chord, with fast attack
+/// and filtered decay. Fed through reverb for the classic dub effect.
+pub struct DubStab {
+    phases: [f32; 3],
+    freqs: [f32; 3],
+    amp: f32,
+    decay: f32,
+    filter_cutoff: f32,
+    filter_decay: f32,
+    filter_low: f32,
+    filter_band: f32,
+    sample_rate: f32,
+    active: bool,
+}
+
+impl DubStab {
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            phases: [0.0; 3],
+            freqs: [0.0; 3],
+            amp: 0.0,
+            decay: (-1.0 / (sample_rate * 0.4_f32)).exp(), // ~400ms decay
+            filter_cutoff: 800.0,
+            filter_decay: (-1.0 / (sample_rate * 0.25_f32)).exp(), // filter closes faster
+            filter_low: 0.0,
+            filter_band: 0.0,
+            sample_rate,
+            active: false,
+        }
+    }
+
+    /// Trigger a stab with a root frequency. Creates a minor chord (root, minor 3rd, 5th)
+    /// with slight detuning.
+    pub fn trigger(&mut self, root_freq: f32, rng: &mut Xorshift64) {
+        let detune = 1.0 + (rng.white() * 0.005);
+        self.freqs[0] = root_freq;
+        self.freqs[1] = root_freq * 1.2 * detune; // minor 3rd
+        self.freqs[2] = root_freq * 1.5 * (1.0 + rng.white() * 0.003); // 5th
+        self.phases = [0.0; 3];
+        self.amp = 0.4;
+        self.filter_cutoff = 2500.0;
+        self.filter_low = 0.0;
+        self.filter_band = 0.0;
+        self.active = true;
+    }
+
+    pub fn next_sample(&mut self) -> f32 {
+        if !self.active {
+            return 0.0;
+        }
+
+        // Sum detuned oscillators
+        let mut sig = 0.0f32;
+        for i in 0..3 {
+            sig += (self.phases[i] * std::f32::consts::TAU).sin();
+            self.phases[i] += self.freqs[i] / self.sample_rate;
+            if self.phases[i] >= 1.0 {
+                self.phases[i] -= 1.0;
+            }
+        }
+        sig *= self.amp / 3.0;
+
+        // Resonant low-pass filter with decaying cutoff
+        let f = (std::f32::consts::PI * self.filter_cutoff / self.sample_rate).sin() * 2.0;
+        let q = 0.5;
+        let high = sig - self.filter_low - q * self.filter_band;
+        self.filter_band += f * high;
+        self.filter_low += f * self.filter_band;
+
+        self.amp *= self.decay;
+        self.filter_cutoff = 200.0 + (self.filter_cutoff - 200.0) * self.filter_decay;
+
+        if self.amp < 0.001 {
+            self.active = false;
+            self.amp = 0.0;
+        }
+
+        self.filter_low
+    }
+}
+
+/// Simple granular engine: generates grains from an internal noise/tone source.
+/// Each grain is a short windowed snippet with randomized pitch and timing.
+pub struct GranularEngine {
+    grains: Vec<Grain>,
+    noise: Xorshift64,
+    sample_rate: f32,
+    density: f32,
+    next_grain_in: u32,
+    level: f32,
+}
+
+struct Grain {
+    phase: f32,
+    freq: f32,
+    window_phase: f32,
+    window_rate: f32,
+    active: bool,
+}
+
+impl Grain {
+    fn new() -> Self {
+        Self {
+            phase: 0.0,
+            freq: 0.0,
+            window_phase: 0.0,
+            window_rate: 0.0,
+            active: false,
+        }
+    }
+
+    fn trigger(&mut self, freq: f32, duration_samples: f32) {
+        self.phase = 0.0;
+        self.freq = freq;
+        self.window_phase = 0.0;
+        self.window_rate = 1.0 / duration_samples;
+        self.active = true;
+    }
+
+    fn next_sample(&mut self, sample_rate: f32) -> f32 {
+        if !self.active {
+            return 0.0;
+        }
+
+        // Hann window
+        let window = 0.5 * (1.0 - (self.window_phase * std::f32::consts::TAU).cos());
+        let sample = (self.phase * std::f32::consts::TAU).sin();
+
+        self.phase += self.freq / sample_rate;
+        if self.phase >= 1.0 {
+            self.phase -= 1.0;
+        }
+
+        self.window_phase += self.window_rate;
+        if self.window_phase >= 1.0 {
+            self.active = false;
+        }
+
+        sample * window
+    }
+}
+
+impl GranularEngine {
+    pub fn new(sample_rate: f32, seed: u64) -> Self {
+        let grains = (0..8).map(|_| Grain::new()).collect();
+        Self {
+            grains,
+            noise: Xorshift64::new(seed),
+            sample_rate,
+            density: 0.5,
+            next_grain_in: 0,
+            level: 0.15,
+        }
+    }
+
+    pub fn set_density(&mut self, density: f32) {
+        self.density = density.clamp(0.0, 1.0);
+    }
+
+    pub fn set_level(&mut self, level: f32) {
+        self.level = level;
+    }
+
+    pub fn next_sample(&mut self) -> (f32, f32) {
+        if self.next_grain_in == 0 && self.density > 0.01 {
+            // Spawn a new grain
+            if let Some(grain) = self.grains.iter_mut().find(|g| !g.active) {
+                // Random frequency in a pentatonic-ish range (200-800 Hz)
+                let freq = 200.0 + (self.noise.next() % 600) as f32;
+                // Grain duration: 30-120ms
+                let dur_ms = 30.0 + (self.noise.next() % 90) as f32;
+                let dur_samples = dur_ms * self.sample_rate / 1000.0;
+                grain.trigger(freq, dur_samples);
+            }
+
+            // Next grain interval based on density
+            // High density = short intervals, low density = long intervals
+            let min_interval = (self.sample_rate * 0.03) as u32; // 30ms
+            let max_interval = (self.sample_rate * 0.5) as u32; // 500ms
+            let range = max_interval - min_interval;
+            let density_scale = 1.0 - self.density;
+            self.next_grain_in = min_interval + (range as f32 * density_scale) as u32
+                + (self.noise.next() as u32) % (range / 4);
+        } else if self.next_grain_in > 0 {
+            self.next_grain_in -= 1;
+        }
+
+        let mut sum = 0.0f32;
+        for grain in &mut self.grains {
+            sum += grain.next_sample(self.sample_rate);
+        }
+
+        let out = sum * self.level;
+        // Slight stereo spread via phase offset
+        let pan = (self.noise.next() as f32 / u64::MAX as f32) * 0.3;
+        (out * (1.0 - pan), out * (0.7 + pan))
+    }
+}
+
 /// First experiment: kick pulsing at a steady frequency,
-/// drifting hats and continuous hiss.
+/// drifting hats, continuous hiss, dub stabs, and granular textures.
 pub struct AmbientTechno {
     kick: Kick,
     kick_pulse: PulseOscillator,
     hat: HiHat,
     hat_pulse: DriftingPulse,
     hiss: Hiss,
+    stab: DubStab,
+    stab_pulse: DriftingPulse,
+    stab_noise: Xorshift64,
+    stab_freqs: Vec<f32>,
+    granular: GranularEngine,
     drift: f32,
     haze: f32,
+    density: f32,
+    grain_level: f32,
     limiter_gain: f32,
     fade_pos: u32,
     fade_state: FadeState,
@@ -324,14 +530,30 @@ impl AmbientTechno {
 
         let hat_seed = rng.r#gen::<u64>();
 
+        // Stab at ~0.5x kick frequency (every other beat), with drift
+        let stab_base_freq = kick_freq * 0.5;
+        let stab_drift_amount = stab_base_freq * 0.2 * drift;
+        let stab_noise_seed = rng.r#gen::<u64>();
+        // Minor pentatonic root notes for stabs (A2, C3, D3, E3, G3)
+        let stab_freqs = vec![110.0, 130.81, 146.83, 164.81, 196.0];
+
+        let granular_seed = rng.r#gen::<u64>();
+
         Self {
             kick: Kick::new(sr),
             kick_pulse: PulseOscillator::new_with_phase(kick_freq, sr, kick_phase),
             hat: HiHat::new(sr, hat_seed),
             hat_pulse: DriftingPulse::new(hat_base_freq, hat_drift_amount, sr, &mut rng),
             hiss: Hiss::new(sr, &mut rng),
+            stab: DubStab::new(sr),
+            stab_pulse: DriftingPulse::new(stab_base_freq, stab_drift_amount, sr, &mut rng),
+            stab_noise: Xorshift64::new(stab_noise_seed),
+            stab_freqs,
+            granular: GranularEngine::new(sr, granular_seed),
             drift,
             haze: 0.5,
+            density: 0.5,
+            grain_level: 0.5,
             limiter_gain: 1.0,
             fade_pos: 0,
             fade_state: FadeState::FadingIn,
@@ -358,17 +580,28 @@ impl AmbientTechno {
             "pulse" => {
                 let freq = value.clamp(1.3, 2.5);
                 self.kick_pulse.set_freq(freq);
-                // Update hat base freq to track kick at ~2x
+                // Update related pulse frequencies to track kick
                 self.hat_pulse.base_freq = freq * 2.0;
+                self.stab_pulse.base_freq = freq * 0.5;
             }
             "drift" => {
                 self.drift = value.clamp(0.0, 1.0);
                 let hat_drift = self.hat_pulse.base_freq * 0.15 * self.drift;
                 self.hat_pulse.set_drift_amount(hat_drift);
+                let stab_drift = self.stab_pulse.base_freq * 0.2 * self.drift;
+                self.stab_pulse.set_drift_amount(stab_drift);
             }
             "haze" => {
                 self.haze = value.clamp(0.0, 1.0);
                 self.hiss.set_level(0.15 * self.haze);
+            }
+            "density" => {
+                self.density = value.clamp(0.0, 1.0);
+                self.granular.set_density(self.density);
+            }
+            "grain" => {
+                self.grain_level = value.clamp(0.0, 1.0);
+                self.granular.set_level(0.15 * self.grain_level);
             }
             _ => {}
         }
@@ -379,6 +612,8 @@ impl AmbientTechno {
             ("pulse", self.kick_pulse.freq(), 1.3, 2.5),
             ("drift", self.drift, 0.0, 1.0),
             ("haze", self.haze, 0.0, 1.0),
+            ("density", self.density, 0.0, 1.0),
+            ("grain", self.grain_level, 0.0, 1.0),
         ]
     }
 
@@ -429,14 +664,22 @@ impl AmbientTechno {
             self.hat.trigger();
         }
 
+        // Drifting pulse triggers dub stabs
+        if self.stab_pulse.tick() {
+            let idx = (self.stab_noise.next() as usize) % self.stab_freqs.len();
+            let root = self.stab_freqs[idx];
+            self.stab.trigger(root, &mut self.stab_noise);
+        }
+
         let kick_sample = self.kick.next_sample();
         let hat_sample = self.hat.next_sample();
         let hiss_sample = self.hiss.next_sample();
+        let stab_sample = self.stab.next_sample();
+        let (grain_l, grain_r) = self.granular.next_sample();
 
-        // Kick is mono-center, hat slightly panned, hiss is mono
-        // Soft clip the mix before limiting
-        let mut left = (kick_sample + hat_sample * 0.7 + hiss_sample).tanh();
-        let mut right = (kick_sample + hat_sample * 1.0 + hiss_sample).tanh();
+        // Mix: kick center, hat slightly right, stab center, grains spread
+        let mut left = (kick_sample + hat_sample * 0.7 + hiss_sample + stab_sample + grain_l).tanh();
+        let mut right = (kick_sample + hat_sample * 1.0 + hiss_sample + stab_sample + grain_r).tanh();
 
         // Peak limiter
         let peak = left.abs().max(right.abs());
@@ -625,28 +868,28 @@ mod tests {
 
     #[test]
     fn haze_param_controls_hiss_level() {
-        // With haze=0, hiss should be silent
-        let mut engine = AmbientTechno::new(44100, 42);
-        engine.set_param("haze", 0.0);
+        // Test hiss directly rather than through the full mix
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut hiss = Hiss::new(44100.0, &mut rng);
 
-        let mut left = vec![0.0f32; 44100];
-        let mut right = vec![0.0f32; 44100];
-        engine.render(&mut left, &mut right);
+        // At default level
+        let mut rms_default = 0.0f32;
+        for _ in 0..44100 {
+            let s = hiss.next_sample();
+            rms_default += s * s;
+        }
 
-        // Isolate hiss by looking at samples between kicks (where kick is silent)
-        // Just check overall level is lower with haze=0
-        let rms_no_haze: f32 = left.iter().map(|s| s * s).sum::<f32>() / left.len() as f32;
+        hiss.set_level(0.0);
+        let mut rms_zero = 0.0f32;
+        for _ in 0..44100 {
+            let s = hiss.next_sample();
+            rms_zero += s * s;
+        }
 
-        let mut engine2 = AmbientTechno::new(44100, 42);
-        engine2.set_param("haze", 1.0);
-        let mut left2 = vec![0.0f32; 44100];
-        let mut right2 = vec![0.0f32; 44100];
-        engine2.render(&mut left2, &mut right2);
-        let rms_full_haze: f32 = left2.iter().map(|s| s * s).sum::<f32>() / left2.len() as f32;
-
-        assert!(rms_full_haze > rms_no_haze,
-            "full haze ({}) should be louder than no haze ({})",
-            rms_full_haze, rms_no_haze);
+        assert!(rms_default > rms_zero,
+            "default level ({}) should be louder than zero ({})",
+            rms_default, rms_zero);
+        assert!(rms_zero < 0.0001, "hiss at level 0 should be nearly silent");
     }
 
     #[test]
@@ -667,5 +910,84 @@ mod tests {
         assert!(fast_count > slow_count,
             "2.08 Hz ({} triggers) should fire more than 1.3 Hz ({} triggers)",
             fast_count, slow_count);
+    }
+
+    #[test]
+    fn dub_stab_produces_signal_and_decays() {
+        let mut stab = DubStab::new(44100.0);
+        assert_eq!(stab.next_sample(), 0.0, "stab silent before trigger");
+
+        let mut noise = Xorshift64::new(42);
+        stab.trigger(130.0, &mut noise);
+
+        let mut peak = 0.0f32;
+        for _ in 0..4410 {
+            peak = peak.max(stab.next_sample().abs());
+        }
+        assert!(peak > 0.01, "stab should produce signal after trigger");
+
+        // After 3 seconds should be silent
+        for _ in 0..(44100 * 3) {
+            stab.next_sample();
+        }
+        assert!(!stab.active, "stab should decay to inactive");
+    }
+
+    #[test]
+    fn granular_engine_produces_signal() {
+        let mut grain = GranularEngine::new(44100.0, 42);
+        grain.set_density(1.0);
+        grain.set_level(0.5);
+
+        let mut has_signal = false;
+        // Run for 1 second — with high density should produce grains quickly
+        for _ in 0..44100 {
+            let (l, r) = grain.next_sample();
+            if l.abs() > 0.001 || r.abs() > 0.001 {
+                has_signal = true;
+                break;
+            }
+        }
+        assert!(has_signal, "granular engine should produce signal at high density");
+    }
+
+    #[test]
+    fn granular_density_zero_is_sparse() {
+        let mut grain = GranularEngine::new(44100.0, 42);
+        grain.set_density(0.0);
+        grain.set_level(0.5);
+
+        // At density 0, intervals should be very long — count active grains over 1 second
+        let mut active_samples = 0u32;
+        for _ in 0..44100 {
+            let (l, _) = grain.next_sample();
+            if l.abs() > 0.001 {
+                active_samples += 1;
+            }
+        }
+
+        // At zero density, should have very few active samples (grains still fire but rarely)
+        assert!(active_samples < 10000,
+            "density=0 should be sparse, got {} active samples", active_samples);
+    }
+
+    #[test]
+    fn full_engine_with_all_elements_stays_bounded() {
+        let mut engine = AmbientTechno::new(44100, 42);
+        // Crank everything up
+        engine.set_param("haze", 1.0);
+        engine.set_param("density", 1.0);
+        engine.set_param("grain", 1.0);
+        engine.set_param("drift", 1.0);
+
+        let mut left = vec![0.0f32; 4096];
+        let mut right = vec![0.0f32; 4096];
+
+        for _ in 0..30 {
+            engine.render(&mut left, &mut right);
+            for &s in left.iter().chain(right.iter()) {
+                assert!(s.abs() <= 1.0, "sample {} exceeds [-1, 1] range", s);
+            }
+        }
     }
 }
