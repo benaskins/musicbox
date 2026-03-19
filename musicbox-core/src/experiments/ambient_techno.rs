@@ -281,17 +281,25 @@ impl DriftingPulse {
     }
 }
 
-/// Dub stab: 2-3 detuned oscillators forming a chord, with fast attack
-/// and filtered decay. Fed through reverb for the classic dub effect.
+/// Dub stab: 2-3 detuned saw/triangle oscillators forming a chord,
+/// with fast attack, band-pass filtered (decaying LPF + fixed HPF),
+/// and fed through dub delay.
 pub struct DubStab {
     phases: [f32; 3],
     freqs: [f32; 3],
+    /// 0.0 = saw, 1.0 = triangle (blends between them)
+    wave_blend: f32,
     amp: f32,
     decay: f32,
-    filter_cutoff: f32,
-    filter_decay: f32,
-    filter_low: f32,
-    filter_band: f32,
+    /// LPF state (decaying cutoff — each stab opens and closes)
+    lp_low: f32,
+    lp_band: f32,
+    lp_cutoff: f32,
+    lp_decay: f32,
+    /// HPF state (fixed cutoff — removes mud)
+    hp_low: f32,
+    hp_band: f32,
+    hp_cutoff: f32,
     sample_rate: f32,
     active: bool,
 }
@@ -301,12 +309,16 @@ impl DubStab {
         Self {
             phases: [0.0; 3],
             freqs: [0.0; 3],
+            wave_blend: 0.4, // mostly saw with some triangle character
             amp: 0.0,
-            decay: (-1.0 / (sample_rate * 0.4_f32)).exp(), // ~400ms decay
-            filter_cutoff: 800.0,
-            filter_decay: (-1.0 / (sample_rate * 0.25_f32)).exp(), // filter closes faster
-            filter_low: 0.0,
-            filter_band: 0.0,
+            decay: (-1.0 / (sample_rate * 0.35_f32)).exp(), // ~350ms decay
+            lp_low: 0.0,
+            lp_band: 0.0,
+            lp_cutoff: 800.0,
+            lp_decay: (-1.0 / (sample_rate * 0.25_f32)).exp(),
+            hp_low: 0.0,
+            hp_band: 0.0,
+            hp_cutoff: 250.0,
             sample_rate,
             active: false,
         }
@@ -322,11 +334,23 @@ impl DubStab {
         self.freqs[1] = root_freq * 1.2 * detune_3rd; // minor 3rd
         self.freqs[2] = root_freq * 1.5 * detune_5th; // 5th
         self.phases = [0.0; 3];
-        self.amp = 0.4;
-        self.filter_cutoff = 2500.0;
-        self.filter_low = 0.0;
-        self.filter_band = 0.0;
+        self.amp = 0.35;
+        self.lp_cutoff = 2500.0;
+        self.lp_low = 0.0;
+        self.lp_band = 0.0;
+        self.hp_low = 0.0;
+        self.hp_band = 0.0;
         self.active = true;
+    }
+
+    #[inline]
+    fn saw(phase: f32) -> f32 {
+        2.0 * phase - 1.0
+    }
+
+    #[inline]
+    fn triangle(phase: f32) -> f32 {
+        4.0 * (phase - (phase + 0.5).floor()).abs() - 1.0
     }
 
     pub fn next_sample(&mut self) -> f32 {
@@ -334,10 +358,12 @@ impl DubStab {
             return 0.0;
         }
 
-        // Sum detuned oscillators
+        // Sum detuned saw/triangle oscillators
         let mut sig = 0.0f32;
         for i in 0..3 {
-            sig += (self.phases[i] * std::f32::consts::TAU).sin();
+            let s = Self::saw(self.phases[i]);
+            let t = Self::triangle(self.phases[i]);
+            sig += s + (t - s) * self.wave_blend;
             self.phases[i] += self.freqs[i] / self.sample_rate;
             if self.phases[i] >= 1.0 {
                 self.phases[i] -= 1.0;
@@ -345,22 +371,77 @@ impl DubStab {
         }
         sig *= self.amp / 3.0;
 
-        // Resonant low-pass filter with decaying cutoff
-        let f = (std::f32::consts::PI * self.filter_cutoff / self.sample_rate).sin() * 2.0;
-        let q = 0.5;
-        let high = sig - self.filter_low - q * self.filter_band;
-        self.filter_band += f * high;
-        self.filter_low += f * self.filter_band;
+        // LPF with decaying cutoff — stab opens bright then closes
+        let lp_f = (std::f32::consts::PI * self.lp_cutoff / self.sample_rate).sin() * 2.0;
+        let lp_q = 0.5;
+        let lp_high = sig - self.lp_low - lp_q * self.lp_band;
+        self.lp_band += lp_f * lp_high;
+        self.lp_low += lp_f * self.lp_band;
+
+        // HPF — fixed cutoff, removes mud
+        let hp_f = (std::f32::consts::PI * self.hp_cutoff / self.sample_rate).sin() * 2.0;
+        let hp_q = 0.5;
+        let hp_high = self.lp_low - self.hp_low - hp_q * self.hp_band;
+        self.hp_band += hp_f * hp_high;
+        self.hp_low += hp_f * self.hp_band;
 
         self.amp *= self.decay;
-        self.filter_cutoff = 200.0 + (self.filter_cutoff - 200.0) * self.filter_decay;
+        self.lp_cutoff = 250.0 + (self.lp_cutoff - 250.0) * self.lp_decay;
 
         if self.amp < 0.001 {
             self.active = false;
             self.amp = 0.0;
         }
 
-        self.filter_low
+        hp_high
+    }
+}
+
+/// Dub delay: long feedback delay with filtering in the feedback path.
+/// Classic dub style — repeats that darken and smear over time.
+struct DubDelay {
+    buffer: crate::dsp::DelayLine,
+    feedback: f32,
+    lp_state: f32,
+    lp_coeff: f32,
+    hp_state: f32,
+    hp_coeff: f32,
+    delay_samples: usize,
+    mix: f32,
+}
+
+impl DubDelay {
+    fn new(delay_ms: f32, feedback: f32, mix: f32, sample_rate: f32) -> Self {
+        let delay_samples = (delay_ms * sample_rate / 1000.0) as usize;
+        Self {
+            buffer: crate::dsp::DelayLine::new(delay_samples + 1),
+            feedback,
+            lp_state: 0.0,
+            lp_coeff: 0.35, // darkening LP in feedback
+            hp_state: 0.0,
+            hp_coeff: 0.05, // removes DC/sub buildup in feedback
+            delay_samples,
+            mix,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> (f32, f32) {
+        let delayed = self.buffer.read_at(self.delay_samples);
+
+        // LP in feedback path — each repeat gets darker
+        self.lp_state += self.lp_coeff * (delayed - self.lp_state);
+        // HP in feedback path — prevents mud accumulation
+        let hp_in = self.lp_state;
+        self.hp_state += self.hp_coeff * (hp_in - self.hp_state);
+        let filtered = hp_in - self.hp_state;
+
+        let write = input + filtered * self.feedback;
+        self.buffer.write_and_advance(write);
+
+        // Stereo: dry left, wet right (classic dub ping-pong feel)
+        let dry = input * (1.0 - self.mix * 0.5);
+        let wet = delayed * self.mix;
+        (dry + wet * 0.4, dry + wet)
     }
 }
 
@@ -492,6 +573,7 @@ pub struct AmbientTechno {
     hat_pulse: DriftingPulse,
     hiss: Hiss,
     stab: DubStab,
+    stab_delay: DubDelay,
     stab_pulse: DriftingPulse,
     stab_noise: Xorshift64,
     stab_freqs: Vec<f32>,
@@ -550,6 +632,7 @@ impl AmbientTechno {
             hat_pulse: DriftingPulse::new(hat_base_freq, hat_drift_amount, sr, &mut rng),
             hiss: Hiss::new(sr, &mut rng),
             stab: DubStab::new(sr),
+            stab_delay: DubDelay::new(375.0, 0.55, 0.6, sr), // ~375ms delay, moderate feedback
             stab_pulse: DriftingPulse::new(stab_base_freq, stab_drift_amount, sr, &mut rng),
             stab_noise: Xorshift64::new(stab_noise_seed),
             stab_freqs,
@@ -679,12 +762,13 @@ impl AmbientTechno {
         let hat_dry = self.hat.next_sample();
         let (hat_l, hat_r) = self.hat_reverb.process(hat_dry);
         let hiss_sample = self.hiss.next_sample();
-        let stab_sample = self.stab.next_sample();
+        let stab_dry = self.stab.next_sample();
+        let (stab_l, stab_r) = self.stab_delay.process(stab_dry);
         let (grain_l, grain_r) = self.granular.next_sample();
 
-        // Mix: kick center, hat through reverb (stereo), stab center, grains spread
-        let mut left = (kick_sample + hat_l + hiss_sample + stab_sample + grain_l).tanh();
-        let mut right = (kick_sample + hat_r + hiss_sample + stab_sample + grain_r).tanh();
+        // Mix: kick center, hat reverb, stab through dub delay, grains spread
+        let mut left = (kick_sample + hat_l + hiss_sample + stab_l + grain_l).tanh();
+        let mut right = (kick_sample + hat_r + hiss_sample + stab_r + grain_r).tanh();
 
         // Peak limiter
         let peak = left.abs().max(right.abs());
