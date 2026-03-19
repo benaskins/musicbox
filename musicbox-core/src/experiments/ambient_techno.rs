@@ -563,18 +563,6 @@ impl GranularEngine {
 pub struct AmbientTechno {
     kick: Kick,
     kick_pulse: PulseOscillator,
-    hat: HiHat,
-    hat_reverb: DattorroReverb,
-    hat_pulse: PulseOscillator,
-    hiss: Hiss,
-    stab: DubStab,
-    stab_delay: DubDelay,
-    stab_pulse: PulseOscillator,
-    stab_noise: Xorshift64,
-    stab_freqs: Vec<f32>,
-    granular: GranularEngine,
-    grain_pulse: PulseOscillator,
-    haze: f32,
     limiter_gain: f32,
     fade_pos: u32,
     fade_state: FadeState,
@@ -601,43 +589,12 @@ const STAB_RATIO: (f32, f32) = (3.0, 5.0);   // 3/5 base
 const GRAIN_RATIO: (f32, f32) = (1.0, 7.0);   // 1/7 base
 
 impl AmbientTechno {
-    pub fn new(sample_rate: u32, seed: u64) -> Self {
+    pub fn new(sample_rate: u32, _seed: u64) -> Self {
         let sr = sample_rate as f32;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-
-        let kick_freq = BASE_FREQ;
-        let hat_freq = BASE_FREQ * HAT_RATIO.0 / HAT_RATIO.1;
-        let stab_freq = BASE_FREQ * STAB_RATIO.0 / STAB_RATIO.1;
-        let grain_freq = BASE_FREQ * GRAIN_RATIO.0 / GRAIN_RATIO.1;
-
-        // All start at phase 0 — first convergence is at t=0, next at ~2 min
-        let hat_seed = rng.r#gen::<u64>();
-        let stab_noise_seed = rng.r#gen::<u64>();
-        let granular_seed = rng.r#gen::<u64>();
-
-        // Minor pentatonic root notes for stabs (A2, C3, D3, E3, G3)
-        let stab_freqs = vec![110.0, 130.81, 146.83, 164.81, 196.0];
-
-        // Dub delay time derived from base: one base cycle in ms
-        let base_period_ms = 1000.0 / BASE_FREQ;
-        // Delay at 3/8 of base period — sits between beats
-        let delay_ms = base_period_ms * 3.0 / 8.0;
 
         Self {
             kick: Kick::new(sr),
-            kick_pulse: PulseOscillator::new(kick_freq, sr),
-            hat: HiHat::new(sr, hat_seed),
-            hat_reverb: DattorroReverb::new(0.92, 0.7, 0.9, 0.02, sr, &mut rng),
-            hat_pulse: PulseOscillator::new(hat_freq, sr),
-            hiss: Hiss::new(sr, &mut rng),
-            stab: DubStab::new(sr),
-            stab_delay: DubDelay::new(delay_ms, 0.55, 0.6, sr),
-            stab_pulse: PulseOscillator::new(stab_freq, sr),
-            stab_noise: Xorshift64::new(stab_noise_seed),
-            stab_freqs,
-            granular: GranularEngine::new(sr, granular_seed, &mut rng),
-            grain_pulse: PulseOscillator::new(grain_freq, sr),
-            haze: 0.5,
+            kick_pulse: PulseOscillator::new(BASE_FREQ, sr),
             limiter_gain: 1.0,
             fade_pos: 0,
             fade_state: FadeState::FadingIn,
@@ -659,20 +616,10 @@ impl AmbientTechno {
         self.fade_state
     }
 
-    pub fn set_param(&mut self, name: &str, value: f32) {
-        match name {
-            "haze" => {
-                self.haze = value.clamp(0.0, 1.0);
-                self.hiss.set_level(0.15 * self.haze);
-            }
-            _ => {}
-        }
-    }
+    pub fn set_param(&mut self, _name: &str, _value: f32) {}
 
     pub fn get_params(&self) -> Vec<(&str, f32, f32, f32)> {
-        vec![
-            ("haze", self.haze, 0.0, 1.0),
-        ]
+        vec![]
     }
 
     pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
@@ -712,36 +659,14 @@ impl AmbientTechno {
             return (0.0, 0.0);
         }
 
-        // Each element triggered by its own pulse oscillator at exact rational multiples
         if self.kick_pulse.tick() {
             self.kick.trigger();
         }
 
-        if self.hat_pulse.tick() {
-            self.hat.trigger();
-        }
+        let sample = self.kick.next_sample();
 
-        if self.stab_pulse.tick() {
-            let idx = (self.stab_noise.next() as usize) % self.stab_freqs.len();
-            let root = self.stab_freqs[idx];
-            self.stab.trigger(root, &mut self.stab_noise);
-        }
-
-        if self.grain_pulse.tick() {
-            self.granular.spawn_grain();
-        }
-
-        let kick_sample = self.kick.next_sample();
-        let hat_dry = self.hat.next_sample();
-        let (hat_l, hat_r) = self.hat_reverb.process(hat_dry);
-        let hiss_sample = self.hiss.next_sample();
-        let stab_dry = self.stab.next_sample();
-        let (stab_l, stab_r) = self.stab_delay.process(stab_dry);
-        let (grain_l, grain_r) = self.granular.next_sample();
-
-        // Mix: kick center, hat reverb, stab dub delay, grains wide
-        let mut left = (kick_sample + hat_l + hiss_sample + stab_l + grain_l).tanh();
-        let mut right = (kick_sample + hat_r + hiss_sample + stab_r + grain_r).tanh();
+        let mut left = sample;
+        let mut right = sample;
 
         // Peak limiter
         let peak = left.abs().max(right.abs());
