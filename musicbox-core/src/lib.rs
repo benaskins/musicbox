@@ -1,4 +1,5 @@
 pub mod dsp;
+pub mod experiments;
 
 use rand::SeedableRng;
 
