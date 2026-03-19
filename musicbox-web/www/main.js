@@ -22,7 +22,7 @@ document.querySelectorAll(".experiment-selector button").forEach(b => {
 });
 
 // ── Knob controls ──
-const knobs = ["pulse", "drift", "haze", "density", "grain"];
+const knobs = ["haze"];
 knobs.forEach(name => {
     const slider = document.getElementById(`knob-${name}`);
     if (slider) {

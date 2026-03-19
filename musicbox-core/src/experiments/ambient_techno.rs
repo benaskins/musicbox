@@ -240,46 +240,6 @@ impl Hiss {
     }
 }
 
-/// A drifting pulse oscillator — its frequency wanders via a slow random walk.
-struct DriftingPulse {
-    pulse: PulseOscillator,
-    base_freq: f32,
-    drift_phase: f32,
-    drift_rate: f32,
-    drift_amount: f32,
-    sample_rate: f32,
-}
-
-impl DriftingPulse {
-    fn new(base_freq: f32, drift_amount: f32, sample_rate: f32, rng: &mut impl Rng) -> Self {
-        let phase = rng.r#gen::<f32>();
-        Self {
-            pulse: PulseOscillator::new_with_phase(base_freq, sample_rate, phase),
-            base_freq,
-            drift_phase: rng.r#gen::<f32>(),
-            drift_rate: rng.r#gen_range(0.03..0.1),
-            drift_amount,
-            sample_rate,
-        }
-    }
-
-    fn tick(&mut self) -> bool {
-        // Update drifting frequency
-        let drift = (self.drift_phase * std::f32::consts::TAU).sin() * self.drift_amount;
-        self.pulse.set_freq(self.base_freq + drift);
-
-        self.drift_phase += self.drift_rate / self.sample_rate;
-        if self.drift_phase >= 1.0 {
-            self.drift_phase -= 1.0;
-        }
-
-        self.pulse.tick()
-    }
-
-    fn set_drift_amount(&mut self, amount: f32) {
-        self.drift_amount = amount;
-    }
-}
 
 /// Dub stab: 2-3 detuned saw/triangle oscillators forming a chord,
 /// with fast attack, band-pass filtered (decaying LPF + fixed HPF),
@@ -453,8 +413,6 @@ pub struct GranularEngine {
     noise: Xorshift64,
     reverb: DattorroReverb,
     sample_rate: f32,
-    density: f32,
-    next_grain_in: u32,
     level: f32,
 }
 
@@ -534,56 +492,42 @@ impl GranularEngine {
             noise: Xorshift64::new(seed),
             reverb: DattorroReverb::new(0.95, 0.6, 0.85, 0.015, sample_rate, rng),
             sample_rate,
-            density: 0.3,
-            next_grain_in: 0,
             level: 0.1,
         }
-    }
-
-    pub fn set_density(&mut self, density: f32) {
-        self.density = density.clamp(0.0, 1.0);
     }
 
     pub fn set_level(&mut self, level: f32) {
         self.level = level;
     }
 
-    pub fn next_sample(&mut self) -> (f32, f32) {
-        if self.next_grain_in == 0 && self.density > 0.01 {
-            if let Some(grain) = self.grains.iter_mut().find(|g| !g.active) {
-                // Pick from high or low frequency pool (70% high shimmer, 30% sub)
-                let is_high = (self.noise.next() % 10) < 7;
-                let freq = if is_high {
-                    GRAIN_FREQS_HIGH[(self.noise.next() as usize) % GRAIN_FREQS_HIGH.len()]
-                } else {
-                    GRAIN_FREQS_LOW[(self.noise.next() as usize) % GRAIN_FREQS_LOW.len()]
-                };
+    /// Spawn a single grain — called by the external pulse oscillator.
+    pub fn spawn_grain(&mut self) {
+        if let Some(grain) = self.grains.iter_mut().find(|g| !g.active) {
+            // Pick from high or low frequency pool (70% high shimmer, 30% sub)
+            let is_high = (self.noise.next() % 10) < 7;
+            let freq = if is_high {
+                GRAIN_FREQS_HIGH[(self.noise.next() as usize) % GRAIN_FREQS_HIGH.len()]
+            } else {
+                GRAIN_FREQS_LOW[(self.noise.next() as usize) % GRAIN_FREQS_LOW.len()]
+            };
 
-                // Long grains: 200ms–1.5s
-                let dur_ms = 200.0 + (self.noise.next() % 1300) as f32;
-                let dur_samples = dur_ms * self.sample_rate / 1000.0;
+            // Long grains: 200ms–1.5s
+            let dur_ms = 200.0 + (self.noise.next() % 1300) as f32;
+            let dur_samples = dur_ms * self.sample_rate / 1000.0;
 
-                // Slow pitch drift: ±10 Hz/sec for high, ±2 Hz/sec for low
-                let drift_range = if is_high { 10.0 } else { 2.0 };
-                let drift = (self.noise.white()) * drift_range;
+            // Slow pitch drift: ±10 Hz/sec for high, ±2 Hz/sec for low
+            let drift_range = if is_high { 10.0 } else { 2.0 };
+            let drift = (self.noise.white()) * drift_range;
 
-                // Wide stereo placement
-                let pan = self.noise.white(); // -1 to 1
+            // Wide stereo placement
+            let pan = self.noise.white();
 
-                grain.trigger(freq, drift, dur_samples, pan);
-            }
-
-            // Sparse intervals: 0.5s–3s, scaled by density
-            let min_interval = (self.sample_rate * 0.5) as u32;
-            let max_interval = (self.sample_rate * 3.0) as u32;
-            let range = max_interval - min_interval;
-            let density_scale = 1.0 - self.density;
-            self.next_grain_in = min_interval + (range as f32 * density_scale) as u32
-                + (self.noise.next() as u32) % (range / 3);
-        } else if self.next_grain_in > 0 {
-            self.next_grain_in -= 1;
+            grain.trigger(freq, drift, dur_samples, pan);
         }
+    }
 
+    /// Generate stereo audio from active grains through reverb.
+    pub fn next_sample(&mut self) -> (f32, f32) {
         let mut sum_l = 0.0f32;
         let mut sum_r = 0.0f32;
         for grain in &mut self.grains {
@@ -600,25 +544,37 @@ impl GranularEngine {
     }
 }
 
-/// First experiment: kick pulsing at a steady frequency,
-/// drifting hats, continuous hiss, dub stabs, and granular textures.
+/// Polyrhythmic ambient techno engine.
+///
+/// All timing derived from a single base frequency (human heartbeat, 1.2 Hz).
+/// Each element pulses at an exact rational multiple of the base, creating
+/// polyrhythms that phase in and out of alignment and fully resolve at the LCM.
+///
+/// ```text
+/// Element   Ratio    Frequency   Resolves with base every
+/// ──────────────────────────────────────────────────────────
+/// Kick      1/1      1.200 Hz    -
+/// Hat       7/4      2.100 Hz    4 base cycles  (3.3s)
+/// Stab      3/5      0.720 Hz    5 base cycles  (4.2s)
+/// Grain     1/7      0.171 Hz    7 base cycles  (5.8s)
+///
+/// Full alignment: LCM(4, 5, 7) = 140 base cycles ≈ 116.7s ≈ ~2 minutes
+/// ```
 pub struct AmbientTechno {
     kick: Kick,
     kick_pulse: PulseOscillator,
     hat: HiHat,
     hat_reverb: DattorroReverb,
-    hat_pulse: DriftingPulse,
+    hat_pulse: PulseOscillator,
     hiss: Hiss,
     stab: DubStab,
     stab_delay: DubDelay,
-    stab_pulse: DriftingPulse,
+    stab_pulse: PulseOscillator,
     stab_noise: Xorshift64,
     stab_freqs: Vec<f32>,
     granular: GranularEngine,
-    drift: f32,
+    grain_pulse: PulseOscillator,
     haze: f32,
-    density: f32,
-    grain_level: f32,
     limiter_gain: f32,
     fade_pos: u32,
     fade_state: FadeState,
@@ -635,49 +591,53 @@ pub enum FadeState {
 
 const FADE_DURATION: f32 = 1.0;
 
+/// Human resting heartbeat — the base frequency from which all rhythms derive.
+const BASE_FREQ: f32 = 1.2;
+
+/// Polyrhythmic ratios (p/q of base frequency).
+/// Chosen so LCM of denominators creates long resolution period.
+const HAT_RATIO: (f32, f32) = (7.0, 4.0);    // 7/4 base
+const STAB_RATIO: (f32, f32) = (3.0, 5.0);   // 3/5 base
+const GRAIN_RATIO: (f32, f32) = (1.0, 7.0);   // 1/7 base
+
 impl AmbientTechno {
     pub fn new(sample_rate: u32, seed: u64) -> Self {
         let sr = sample_rate as f32;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-        // ~2.08 Hz = ~125 BPM
-        let kick_freq = 2.0833;
-        // Start at a random phase so the first kick isn't always at sample 0
-        let kick_phase = rng.r#gen::<f32>();
+        let kick_freq = BASE_FREQ;
+        let hat_freq = BASE_FREQ * HAT_RATIO.0 / HAT_RATIO.1;
+        let stab_freq = BASE_FREQ * STAB_RATIO.0 / STAB_RATIO.1;
+        let grain_freq = BASE_FREQ * GRAIN_RATIO.0 / GRAIN_RATIO.1;
 
-        // Hat at ~0.5x kick frequency (every other beat), with drift
-        let hat_base_freq = kick_freq * 0.5;
-        let drift = 0.5;
-        let hat_drift_amount = hat_base_freq * 0.15 * drift;
-
+        // All start at phase 0 — first convergence is at t=0, next at ~2 min
         let hat_seed = rng.r#gen::<u64>();
-
-        // Stab at ~0.5x kick frequency (every other beat), with drift
-        let stab_base_freq = kick_freq * 0.5;
-        let stab_drift_amount = stab_base_freq * 0.2 * drift;
         let stab_noise_seed = rng.r#gen::<u64>();
+        let granular_seed = rng.r#gen::<u64>();
+
         // Minor pentatonic root notes for stabs (A2, C3, D3, E3, G3)
         let stab_freqs = vec![110.0, 130.81, 146.83, 164.81, 196.0];
 
-        let granular_seed = rng.r#gen::<u64>();
+        // Dub delay time derived from base: one base cycle in ms
+        let base_period_ms = 1000.0 / BASE_FREQ;
+        // Delay at 3/8 of base period — sits between beats
+        let delay_ms = base_period_ms * 3.0 / 8.0;
 
         Self {
             kick: Kick::new(sr),
-            kick_pulse: PulseOscillator::new_with_phase(kick_freq, sr, kick_phase),
+            kick_pulse: PulseOscillator::new(kick_freq, sr),
             hat: HiHat::new(sr, hat_seed),
             hat_reverb: DattorroReverb::new(0.92, 0.7, 0.9, 0.02, sr, &mut rng),
-            hat_pulse: DriftingPulse::new(hat_base_freq, hat_drift_amount, sr, &mut rng),
+            hat_pulse: PulseOscillator::new(hat_freq, sr),
             hiss: Hiss::new(sr, &mut rng),
             stab: DubStab::new(sr),
-            stab_delay: DubDelay::new(375.0, 0.55, 0.6, sr), // ~375ms delay, moderate feedback
-            stab_pulse: DriftingPulse::new(stab_base_freq, stab_drift_amount, sr, &mut rng),
+            stab_delay: DubDelay::new(delay_ms, 0.55, 0.6, sr),
+            stab_pulse: PulseOscillator::new(stab_freq, sr),
             stab_noise: Xorshift64::new(stab_noise_seed),
             stab_freqs,
             granular: GranularEngine::new(sr, granular_seed, &mut rng),
-            drift,
+            grain_pulse: PulseOscillator::new(grain_freq, sr),
             haze: 0.5,
-            density: 0.5,
-            grain_level: 0.5,
             limiter_gain: 1.0,
             fade_pos: 0,
             fade_state: FadeState::FadingIn,
@@ -701,31 +661,9 @@ impl AmbientTechno {
 
     pub fn set_param(&mut self, name: &str, value: f32) {
         match name {
-            "pulse" => {
-                let freq = value.clamp(1.3, 2.5);
-                self.kick_pulse.set_freq(freq);
-                // Update related pulse frequencies to track kick
-                self.hat_pulse.base_freq = freq * 2.0;
-                self.stab_pulse.base_freq = freq * 0.5;
-            }
-            "drift" => {
-                self.drift = value.clamp(0.0, 1.0);
-                let hat_drift = self.hat_pulse.base_freq * 0.15 * self.drift;
-                self.hat_pulse.set_drift_amount(hat_drift);
-                let stab_drift = self.stab_pulse.base_freq * 0.2 * self.drift;
-                self.stab_pulse.set_drift_amount(stab_drift);
-            }
             "haze" => {
                 self.haze = value.clamp(0.0, 1.0);
                 self.hiss.set_level(0.15 * self.haze);
-            }
-            "density" => {
-                self.density = value.clamp(0.0, 1.0);
-                self.granular.set_density(self.density);
-            }
-            "grain" => {
-                self.grain_level = value.clamp(0.0, 1.0);
-                self.granular.set_level(0.15 * self.grain_level);
             }
             _ => {}
         }
@@ -733,11 +671,7 @@ impl AmbientTechno {
 
     pub fn get_params(&self) -> Vec<(&str, f32, f32, f32)> {
         vec![
-            ("pulse", self.kick_pulse.freq(), 1.3, 2.5),
-            ("drift", self.drift, 0.0, 1.0),
             ("haze", self.haze, 0.0, 1.0),
-            ("density", self.density, 0.0, 1.0),
-            ("grain", self.grain_level, 0.0, 1.0),
         ]
     }
 
@@ -778,21 +712,23 @@ impl AmbientTechno {
             return (0.0, 0.0);
         }
 
-        // Pulse oscillator triggers the kick
+        // Each element triggered by its own pulse oscillator at exact rational multiples
         if self.kick_pulse.tick() {
             self.kick.trigger();
         }
 
-        // Drifting pulse triggers the hat
         if self.hat_pulse.tick() {
             self.hat.trigger();
         }
 
-        // Drifting pulse triggers dub stabs
         if self.stab_pulse.tick() {
             let idx = (self.stab_noise.next() as usize) % self.stab_freqs.len();
             let root = self.stab_freqs[idx];
             self.stab.trigger(root, &mut self.stab_noise);
+        }
+
+        if self.grain_pulse.tick() {
+            self.granular.spawn_grain();
         }
 
         let kick_sample = self.kick.next_sample();
@@ -803,7 +739,7 @@ impl AmbientTechno {
         let (stab_l, stab_r) = self.stab_delay.process(stab_dry);
         let (grain_l, grain_r) = self.granular.next_sample();
 
-        // Mix: kick center, hat reverb, stab through dub delay, grains spread
+        // Mix: kick center, hat reverb, stab dub delay, grains wide
         let mut left = (kick_sample + hat_l + hiss_sample + stab_l + grain_l).tanh();
         let mut right = (kick_sample + hat_r + hiss_sample + stab_r + grain_r).tanh();
 
@@ -968,31 +904,6 @@ mod tests {
     }
 
     #[test]
-    fn drifting_pulse_frequency_varies() {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let mut dp = DriftingPulse::new(4.0, 0.5, 44100.0, &mut rng);
-
-        // Collect trigger intervals over 5 seconds
-        let mut intervals = Vec::new();
-        let mut since_last = 0u32;
-        for _ in 0..220500 {
-            if dp.tick() {
-                if since_last > 0 {
-                    intervals.push(since_last);
-                }
-                since_last = 0;
-            }
-            since_last += 1;
-        }
-
-        assert!(intervals.len() >= 2, "should have multiple triggers");
-        // Intervals should vary (not all identical)
-        let first = intervals[0];
-        let varies = intervals.iter().any(|&i| (i as i32 - first as i32).unsigned_abs() > 10);
-        assert!(varies, "drifting pulse intervals should vary, got {:?}", &intervals[..intervals.len().min(5)]);
-    }
-
-    #[test]
     fn haze_param_controls_hiss_level() {
         // Test hiss directly rather than through the full mix
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
@@ -1063,11 +974,11 @@ mod tests {
     fn granular_engine_produces_signal() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let mut grain = GranularEngine::new(44100.0, 42, &mut rng);
-        grain.set_density(1.0);
         grain.set_level(0.5);
 
+        // Spawn a grain and check it produces signal
+        grain.spawn_grain();
         let mut has_signal = false;
-        // Run for 1 second — with high density should produce grains quickly
         for _ in 0..44100 {
             let (l, r) = grain.next_sample();
             if l.abs() > 0.001 || r.abs() > 0.001 {
@@ -1075,28 +986,46 @@ mod tests {
                 break;
             }
         }
-        assert!(has_signal, "granular engine should produce signal at high density");
+        assert!(has_signal, "granular engine should produce signal after spawn");
     }
 
     #[test]
-    fn granular_density_zero_is_sparse() {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let mut grain = GranularEngine::new(44100.0, 42, &mut rng);
-        grain.set_density(0.0);
-        grain.set_level(0.5);
+    fn polyrhythm_ratios_produce_correct_trigger_counts() {
+        let sr = 44100.0;
+        let base = BASE_FREQ;
+        let duration_s = 20.0;
 
-        // At density 0, intervals should be very long — count active grains over 1 second
-        let mut active_samples = 0u32;
-        for _ in 0..44100 {
-            let (l, _) = grain.next_sample();
-            if l.abs() > 0.001 {
-                active_samples += 1;
-            }
+        let mut kick = PulseOscillator::new(base, sr);
+        let mut hat = PulseOscillator::new(base * HAT_RATIO.0 / HAT_RATIO.1, sr);
+        let mut stab = PulseOscillator::new(base * STAB_RATIO.0 / STAB_RATIO.1, sr);
+        let mut grain = PulseOscillator::new(base * GRAIN_RATIO.0 / GRAIN_RATIO.1, sr);
+
+        let mut counts = [0u32; 4];
+        for _ in 0..(sr as u32 * duration_s as u32) {
+            if kick.tick() { counts[0] += 1; }
+            if hat.tick() { counts[1] += 1; }
+            if stab.tick() { counts[2] += 1; }
+            if grain.tick() { counts[3] += 1; }
         }
 
-        // At zero density, should have very few active samples (grains still fire but rarely)
-        assert!(active_samples < 10000,
-            "density=0 should be sparse, got {} active samples", active_samples);
+        // Expected: base*duration triggers for each
+        // kick:  1.2 * 20 = 24
+        // hat:   2.1 * 20 = 42
+        // stab:  0.72 * 20 = 14.4 → 14
+        // grain: 0.1714 * 20 = 3.4 → 3
+        assert!((counts[0] as i32 - 24).unsigned_abs() <= 1,
+            "kick: expected ~24, got {}", counts[0]);
+        assert!((counts[1] as i32 - 42).unsigned_abs() <= 1,
+            "hat: expected ~42, got {}", counts[1]);
+        assert!((counts[2] as i32 - 14).unsigned_abs() <= 1,
+            "stab: expected ~14, got {}", counts[2]);
+        assert!((counts[3] as i32 - 3).unsigned_abs() <= 1,
+            "grain: expected ~3, got {}", counts[3]);
+
+        // Verify the ratios hold: hat/kick ≈ 7/4, stab/kick ≈ 3/5
+        let hat_ratio = counts[1] as f32 / counts[0] as f32;
+        assert!((hat_ratio - 7.0 / 4.0).abs() < 0.1,
+            "hat/kick ratio should be ~1.75, got {}", hat_ratio);
     }
 
     #[test]
