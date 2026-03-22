@@ -119,7 +119,7 @@ function setStatus(text) {
 async function loadWasm() {
     if (wasmBytes) return wasmBytes;
     setStatus("Loading WASM...");
-    const response = await fetch("pkg/musicbox_web_bg.wasm");
+    const response = await fetch("pkg/musicbox_web_bg.wasm", { cache: "no-store" });
     wasmBytes = await response.arrayBuffer();
     return wasmBytes;
 }
