@@ -1,5 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use musicbox_core::{MusicBox, State, parse_duration};
+use musicbox_core::experiments::ambient_techno::{AmbientTechno, FadeState};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -191,8 +192,98 @@ fn run_render(duration_str: &str, output_path: &str) {
     println!("\r  100% — wrote {}", output_path);
 }
 
+fn run_live_techno() {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .expect("no audio output device found");
+
+    println!("Using audio device: {}", device.name().unwrap_or_default());
+
+    let config = device.default_output_config().unwrap();
+    println!("Audio format: {:?}", config);
+
+    let channels = config.channels() as usize;
+    let sample_rate = config.sample_rate().0;
+    let mut engine = AmbientTechno::new(sample_rate, random_seed());
+
+    let master_state = Arc::new(AtomicU8::new(STATE_FADING_IN));
+    let master_state_signal = Arc::clone(&master_state);
+
+    ctrlc::set_handler(move || {
+        let prev = master_state_signal.load(Ordering::Relaxed);
+        if prev == STATE_FADING_IN || prev == STATE_PLAYING {
+            println!("\nFading out...");
+            master_state_signal.store(STATE_FADING_OUT, Ordering::Relaxed);
+        }
+    })
+    .expect("failed to set signal handler");
+
+    let max_frames = 8192;
+    let mut left_buf = vec![0.0f32; max_frames];
+    let mut right_buf = vec![0.0f32; max_frames];
+
+    let master_state_cb = Arc::clone(&master_state);
+    let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        let sig_state = master_state_cb.load(Ordering::Relaxed);
+        if sig_state == STATE_FADING_OUT
+            && engine.state() != FadeState::FadingOut
+            && engine.state() != FadeState::Done
+        {
+            engine.start_fade_out();
+        }
+
+        match engine.state() {
+            FadeState::Playing => master_state_cb.store(STATE_PLAYING, Ordering::Relaxed),
+            FadeState::Done => master_state_cb.store(STATE_DONE, Ordering::Relaxed),
+            _ => {}
+        }
+
+        let frames = (data.len() / channels).min(max_frames);
+        engine.render(&mut left_buf[..frames], &mut right_buf[..frames]);
+
+        for (i, frame) in data.chunks_mut(channels).enumerate().take(frames) {
+            if channels >= 2 {
+                frame[0] = left_buf[i];
+                frame[1] = right_buf[i];
+                for s in frame[2..].iter_mut() {
+                    *s = (left_buf[i] + right_buf[i]) * 0.5;
+                }
+            } else {
+                frame[0] = (left_buf[i] + right_buf[i]) * 0.5;
+            }
+        }
+    };
+
+    let err_callback = |err: cpal::StreamError| {
+        eprintln!("Audio stream error: {}", err);
+    };
+
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device
+            .build_output_stream(&config.into(), callback, err_callback, None)
+            .unwrap(),
+        _ => panic!("unsupported sample format — expected F32"),
+    };
+
+    stream.play().unwrap();
+    println!("musicbox [techno] is playing... press Ctrl+C to stop");
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if master_state.load(Ordering::Relaxed) == STATE_DONE {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            println!("Goodbye.");
+            break;
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Parse optional style as first positional arg (defaults to "drone")
+    let style = args.get(1).map(|s| s.as_str()).unwrap_or("drone");
 
     if args.len() >= 3 && args[1] == "--render" {
         let duration = &args[2];
@@ -206,13 +297,21 @@ fn main() {
         println!("musicbox v0.1.0 — generative ambient audio");
         println!();
         println!("Usage:");
-        println!("  musicbox              Play live (Ctrl+C to fade out and stop)");
+        println!("  musicbox [style]              Play live (Ctrl+C to fade out and stop)");
         println!("  musicbox --render <duration> [output.wav]");
         println!();
+        println!("Styles: drone (default), techno");
         println!("Duration examples: 10m, 1h30m, 90s, 5m30s");
         println!();
         println!("Each run is unique — the generative engine is seeded randomly.");
     } else {
-        run_live();
+        match style {
+            "techno" => run_live_techno(),
+            "drone" => run_live(),
+            other => {
+                eprintln!("Unknown style '{}'. Available styles: drone, techno", other);
+                std::process::exit(1);
+            }
+        }
     }
 }
