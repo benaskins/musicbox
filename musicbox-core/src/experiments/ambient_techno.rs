@@ -88,7 +88,7 @@ impl SwingLfo {
     pub fn offset_samples(&self, beat_duration: u32) -> u32 {
         let max_swing = beat_duration / 4 / 3;
         let t = (self.phase * std::f32::consts::TAU).sin() * 0.5 + 0.5; // 0..1
-        let t = 0.5 + t * 0.5; // remap to 0.5..1.0 — never fully straight
+        let t = 0.75 + t * 0.25; // remap to 0.75..1.0 — never fully straight
         (t * max_swing as f32) as u32
     }
 }
@@ -1158,6 +1158,7 @@ pub struct AmbientTechno {
     hat: HiHat,
     closed_hat: HiHat,
     closed_hat_lpf: ResonantLpf,
+    hat_phaser: Phaser,
     beat_phase: u32,
     beat_duration: u32,
     swing: SwingLfo,
@@ -1258,6 +1259,7 @@ impl AmbientTechno {
             hat: HiHat::new(sr, 0xDEADBEEF),
             closed_hat: HiHat::new_closed(sr, 0xFEEDFACE),
             closed_hat_lpf: ResonantLpf::new(3000.0, 6000.0, 0.2, 0.1, sr, &mut rng),
+            hat_phaser: Phaser::new(0.7, 0.3, 0.25, sr),
             beat_phase: 0,
             beat_duration: (sr / BASE_FREQ) as u32,
             swing: SwingLfo::new(),
@@ -1657,6 +1659,7 @@ impl AmbientTechno {
         let (rev_rev_l, rev_rev_r) = self.rev_rev_reverb.process(rev_rev_input);
         let hat = self.hat.next_sample();
         let closed_hat = self.closed_hat_lpf.process(self.closed_hat.next_sample());
+        let (hat_l, hat_r) = self.hat_phaser.process(hat + closed_hat);
         let rim_dry = self.rim.next_sample();
         let rim_echoed = self.rim_delay.process(rim_dry);
         let (rim_l, rim_r) = self.rim_reverb.process(rim_echoed);
@@ -1679,8 +1682,8 @@ impl AmbientTechno {
         let (clave_l, clave_r) = self.clave_reverb.process((clave_dl + clave_dr) * 0.5);
 
         // Kick centre, snare centre, hat panned slightly left, closed hat centre, rim slightly right, stabs, pad and mono centre
-        let mut left = kick + snare_l * 0.425 + ghost_snare_l * 0.3 + rev_rev_l * 0.25 + hat * 0.7 + closed_hat + rim_l * 0.8 + stab_l * 0.6 + stab2_l * 0.6 + stab3_l * 0.7 + pad_l + mono_l * 0.09375 + clave_l * 0.5;
-        let mut right = kick + snare_r * 0.425 + ghost_snare_r * 0.3 + rev_rev_r * 0.25 + hat * 0.4 + closed_hat + rim_r * 0.8 + stab_r * 0.6 + stab2_r * 0.6 + stab3_r * 0.7 + pad_r + mono_r * 0.09375 + clave_r * 0.5;
+        let mut left = kick + snare_l * 0.425 + ghost_snare_l * 0.3 + rev_rev_l * 0.25 + hat_l * 0.7 + rim_l * 0.8 + stab_l * 0.6 + stab2_l * 0.6 + stab3_l * 0.7 + pad_l + mono_l * 0.09375 + clave_l * 0.5;
+        let mut right = kick + snare_r * 0.425 + ghost_snare_r * 0.3 + rev_rev_r * 0.25 + hat_r * 0.7 + rim_r * 0.8 + stab_r * 0.6 + stab2_r * 0.6 + stab3_r * 0.7 + pad_r + mono_r * 0.09375 + clave_r * 0.5;
 
         // Peak limiter
         let peak = left.abs().max(right.abs());
