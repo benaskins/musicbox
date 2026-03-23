@@ -1327,7 +1327,7 @@ impl AmbientTechno {
                 Pattern::new(0.7, 0.3, 16, true), // PATTERN_STAB3
                 Pattern::new(0.2, 0.4, 8, true),  // PATTERN_PAD
                 Pattern::new(0.1, 0.3, 8, true),  // PATTERN_MONO
-                Pattern::new(1.0, 0.3, 2, false),  // PATTERN_CLAVE
+                Pattern::new(0.1, 0.3, 2, false),  // PATTERN_CLAVE
             ],
             pattern_rng: Xorshift64::new(rng.r#gen::<u64>() | 1),
             sample_rate: sr,
