@@ -1037,6 +1037,44 @@ const STAB3_CHORDS: [[f32; 3]; 5] = [
     [ 55.00,  73.42,  87.31], // Dm/A A1 D2 F2
 ];
 
+// Pattern indices
+const PATTERN_KICK:  usize = 0;
+const PATTERN_SNARE: usize = 1;
+const PATTERN_HATS:  usize = 2;
+const PATTERN_RIM:   usize = 3;
+const PATTERN_STAB1: usize = 4;
+const PATTERN_STAB2: usize = 5;
+const PATTERN_STAB3: usize = 6;
+const PATTERN_PAD:   usize = 7;
+const PATTERN_MONO:  usize = 8;
+const NUM_PATTERNS:  usize = 9;
+
+/// One instrument group. Config fields are set once; runtime fields track playback state.
+#[derive(Clone, Copy)]
+struct Pattern {
+    // Config (set once)
+    start_weight:    f32,  // probability of turning on when off (0..1)
+    continue_weight: f32,  // probability of staying on after minimum_repeats (0..1)
+    minimum_repeats: u32,  // must stay on at least this many 8-bar segments
+    can_solo:        bool, // allowed to be the only active pattern
+    // Runtime
+    active:          bool,
+    segments_active: u32,  // how many 8-bar segments this has been continuously active
+}
+
+impl Pattern {
+    fn new(start_weight: f32, continue_weight: f32, minimum_repeats: u32, can_solo: bool) -> Self {
+        Self {
+            start_weight,
+            continue_weight,
+            minimum_repeats,
+            can_solo,
+            active: false,
+            segments_active: 0,
+        }
+    }
+}
+
 /// Polyrhythmic ambient techno engine.
 ///
 /// All timing derived from a single base frequency (human heartbeat, 1.2 Hz).
@@ -1117,6 +1155,8 @@ pub struct AmbientTechno {
     mono_seq_repeats: u8,       // how many full playthroughs of the current sequence
     mono_downbeat_timer: Option<u32>,
     mono_rng: Xorshift64,
+    patterns: [Pattern; NUM_PATTERNS],
+    pattern_rng: Xorshift64,
     sample_rate: f32,
     limiter_gain: f32,
     fade_pos: u32,
@@ -1212,12 +1252,26 @@ impl AmbientTechno {
             mono_seq_repeats: 0,
             mono_downbeat_timer: None,
             mono_rng: Xorshift64::new(rng.r#gen::<u64>() | 1),
+            // Placeholder weights — caller will configure via set_pattern() before first use.
+            patterns: [
+                Pattern::new(0.2, 0.6, 4, false), // PATTERN_KICK
+                Pattern::new(0.1, 0.4, 4, false), // PATTERN_SNARE
+                Pattern::new(0.5, 0.5, 4, false), // PATTERN_HATS
+                Pattern::new(0.8, 0.4, 8, true),  // PATTERN_RIM
+                Pattern::new(0.3, 0.5, 4, true),  // PATTERN_STAB1
+                Pattern::new(0.2, 0.5, 4, true),  // PATTERN_STAB2
+                Pattern::new(0.7, 0.3, 16, true), // PATTERN_STAB3
+                Pattern::new(0.2, 0.4, 8, true),  // PATTERN_PAD
+                Pattern::new(0.1, 0.3, 8, true),  // PATTERN_MONO
+            ],
+            pattern_rng: Xorshift64::new(rng.r#gen::<u64>() | 1),
             sample_rate: sr,
             limiter_gain: 1.0,
             fade_pos: 0,
             fade_state: FadeState::FadingIn,
             fade_samples: (sr * FADE_DURATION) as u32,
         };
+        engine.update_patterns(); // initial pattern selection
         engine
     }
 
@@ -1233,6 +1287,61 @@ impl AmbientTechno {
             let shift = (self.mono_rng.next() % 7) as i32 - 3; // -3..=3
             let idx = (base_idx as i32 + shift).clamp(0, A_MINOR_SCALE.len() as i32 - 1) as usize;
             self.mono_seq_freqs[pos] = A_MINOR_SCALE[idx];
+        }
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        self.pattern_rng.next() as f32 / u64::MAX as f32
+    }
+
+    fn update_patterns(&mut self) {
+        // Step 1: tick active patterns; deactivate those past minimum_repeats that fail continue roll.
+        for i in 0..NUM_PATTERNS {
+            if self.patterns[i].active {
+                self.patterns[i].segments_active += 1;
+                if self.patterns[i].segments_active >= self.patterns[i].minimum_repeats {
+                    if self.next_f32() > self.patterns[i].continue_weight {
+                        self.patterns[i].active = false;
+                        self.patterns[i].segments_active = 0;
+                    }
+                }
+            }
+        }
+
+        // Step 2: try to activate inactive patterns by start_weight.
+        for i in 0..NUM_PATTERNS {
+            if !self.patterns[i].active && self.next_f32() < self.patterns[i].start_weight {
+                self.patterns[i].active = true;
+                self.patterns[i].segments_active = 0;
+            }
+        }
+
+        // Step 3: if nothing is active, force the highest-start_weight pattern on.
+        let active_count = self.patterns.iter().filter(|p| p.active).count();
+        if active_count == 0 {
+            let best = (0..NUM_PATTERNS)
+                .max_by(|&a, &b| self.patterns[a].start_weight
+                    .partial_cmp(&self.patterns[b].start_weight).unwrap())
+                .unwrap();
+            self.patterns[best].active = true;
+            self.patterns[best].segments_active = 0;
+        }
+
+        // Step 4: if only one pattern is active and it can't solo, force-add the
+        // highest-start_weight inactive pattern.
+        let active_count = self.patterns.iter().filter(|p| p.active).count();
+        if active_count == 1 {
+            let solo_idx = (0..NUM_PATTERNS).find(|&i| self.patterns[i].active).unwrap();
+            if !self.patterns[solo_idx].can_solo {
+                if let Some(best) = (0..NUM_PATTERNS)
+                    .filter(|&i| !self.patterns[i].active)
+                    .max_by(|&a, &b| self.patterns[a].start_weight
+                        .partial_cmp(&self.patterns[b].start_weight).unwrap())
+                {
+                    self.patterns[best].active = true;
+                    self.patterns[best].segments_active = 0;
+                }
+            }
         }
     }
 
@@ -1310,31 +1419,37 @@ impl AmbientTechno {
             // Advance the swing LFO and recompute all trigger positions (including the kick itself).
             self.swing.advance();
             let sw = self.swing.offset_samples(self.beat_duration);
-            self.kick_timer = Some(sw);
-            self.mono_downbeat_timer = Some(sw);
+
+            // Every 8 bars (32 beats): re-evaluate which patterns are active.
+            if self.beat_count % 32 == 0 {
+                self.update_patterns();
+            }
+
+            if self.patterns[PATTERN_KICK].active {
+                self.kick_timer = Some(sw);
+            }
+            if self.patterns[PATTERN_MONO].active {
+                self.mono_downbeat_timer = Some(sw);
+            }
             let sixteenth = self.beat_duration / 4;
             self.open_hat_position = self.beat_duration / 2 + sw;
             self.closed_hat_positions = [sixteenth + sw, sixteenth * 2, sixteenth * 3 + sw];
-            if self.beat_count % 8 == 0 {
+            self.roll_active = self.patterns[PATTERN_HATS].active && self.beat_count % 8 == 7;
+            if self.beat_count % 8 == 0 && self.patterns[PATTERN_PAD].active {
                 // Every 8 beats: pick a new high pentatonic note for the pad
                 let idx = (self.pad_rng.next() as usize) % PAD_FREQS.len();
                 self.pad.trigger_minor_chord(PAD_FREQS[idx]);
             }
-            if self.beat_count % 32 == 0 {
+            if self.beat_count % 32 == 0 && self.patterns[PATTERN_STAB3].active {
                 // Every 32nd beat (0, 32, 64…): trigger stab3 on the downbeat
                 let idx = (self.stab_rng.next() as usize) % STAB3_CHORDS.len();
                 self.stab3.trigger_with_chord_and_cutoff(STAB3_CHORDS[idx], 600.0, &mut self.stab_rng);
             }
-            // Mark whether this beat is the last of a 2-measure (8-beat) cycle — triggers a roll.
-            self.roll_active = self.beat_count % 8 == 7;
-            // Snare on beat 2 of every 4-beat group (half-time backbeat), swung by sw.
-            if self.beat_count % 4 == 2 {
+            if self.beat_count % 4 == 2 && self.patterns[PATTERN_SNARE].active {
                 self.snare_timer = Some(sw);
-                // Cut reverse reverb input so its tail rings through the hit.
                 self.rev_rev_active = false;
             }
-            // One beat before each snare: start the reverse reverb swell.
-            if self.beat_count % 4 == 1 {
+            if self.beat_count % 4 == 1 && self.patterns[PATTERN_SNARE].active {
                 self.rev_rev_active = true;
                 self.rev_rev_amp = 0.0;
                 self.rev_rev_rise_rate = 1.0 / self.beat_duration as f32;
@@ -1342,19 +1457,16 @@ impl AmbientTechno {
                 self.rev_rev_bp_band = 0.0;
             }
             self.beat_count += 1;
-            if self.beat_count % 2 == 0 {
-                // Every second beat: schedule a ghost kick one swung 8th note later
+            if self.beat_count % 2 == 0 && self.patterns[PATTERN_KICK].active {
                 let eighth_note = (self.sample_rate / (BASE_FREQ * 2.0)) as u32;
                 self.ghost_timer = Some(eighth_note + sw);
             }
-            if self.beat_count % 8 == 7 {
-                // One beat before every 8th beat: schedule stab1 1/16th note before it lands
+            if self.beat_count % 8 == 7 && self.patterns[PATTERN_STAB1].active {
                 let sixteenth = (self.sample_rate / (BASE_FREQ * 4.0)) as u32;
                 let beat = (self.sample_rate / BASE_FREQ) as u32;
                 self.stab_timer = Some(beat - sixteenth + sw);
             }
-            if self.beat_count % 4 == 3 {
-                // One beat before every 4th beat: schedule stab2 1/16th note before it lands
+            if self.beat_count % 4 == 3 && self.patterns[PATTERN_STAB2].active {
                 let sixteenth = (self.sample_rate / (BASE_FREQ * 4.0)) as u32;
                 let beat = (self.sample_rate / BASE_FREQ) as u32;
                 self.stab2_timer = Some(beat - sixteenth + sw);
@@ -1408,24 +1520,21 @@ impl AmbientTechno {
         });
 
         // Open hat is phase-locked to kick: fires at the swung halfway point of each beat (off-beat).
-        if self.beat_phase == self.open_hat_position {
+        if self.patterns[PATTERN_HATS].active && self.beat_phase == self.open_hat_position {
             self.hat.trigger();
         }
 
-        // Closed hats are phase-locked to the kick: fire at swung 16th note positions.
-        // beat_phase resets to 0 when the kick fires (see above), so these never drift.
-        if self.beat_phase == self.closed_hat_positions[0]
+        let at_closed_hat_pos = self.beat_phase == self.closed_hat_positions[0]
             || self.beat_phase == self.closed_hat_positions[1]
-            || self.beat_phase == self.closed_hat_positions[2]
-        {
+            || self.beat_phase == self.closed_hat_positions[2];
+
+        // Closed hats are phase-locked to the kick: fire at swung 16th note positions.
+        if self.patterns[PATTERN_HATS].active && at_closed_hat_pos {
             self.closed_hat.trigger();
         }
 
         // Monosynth off-beat 16th notes share the same swung positions as the closed hats.
-        if self.beat_phase == self.closed_hat_positions[0]
-            || self.beat_phase == self.closed_hat_positions[1]
-            || self.beat_phase == self.closed_hat_positions[2]
-        {
+        if self.patterns[PATTERN_MONO].active && at_closed_hat_pos {
             self.mono.trigger(self.mono_seq_freqs[self.mono_step], self.mono_step % 3 == 0);
             self.advance_mono_step();
         }
@@ -1445,7 +1554,7 @@ impl AmbientTechno {
         }
 
         self.beat_phase += 1;
-        if self.rim_pulse.tick() {
+        if self.patterns[PATTERN_RIM].active && self.rim_pulse.tick() {
             self.rim.trigger();
         }
 
