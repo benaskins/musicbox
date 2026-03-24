@@ -4,8 +4,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-
-	"github.com/benaskins/axon"
 )
 
 func main() {
@@ -20,5 +18,7 @@ func main() {
 	}
 
 	slog.Info("serving musicbox", "dir", dir, "port", port)
-	axon.ListenAndServe(port, http.FileServer(http.Dir(dir)))
+	if err := http.ListenAndServe(":"+port, http.FileServer(http.Dir(dir))); err != nil {
+		slog.Error("server failed", "err", err)
+	}
 }
