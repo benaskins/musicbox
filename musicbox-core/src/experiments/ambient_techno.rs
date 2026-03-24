@@ -412,52 +412,6 @@ impl HiHat {
     }
 }
 
-/// Continuous hiss layer: filtered noise, always present.
-/// Level modulated by a slow LFO for breathing texture.
-struct Hiss {
-    noise: Xorshift64,
-    filter: ResonantLpf,
-    lfo_phase: f32,
-    lfo_rate: f32,
-    base_level: f32,
-    sample_rate: f32,
-}
-
-impl Hiss {
-    fn new(sample_rate: f32, rng: &mut impl Rng) -> Self {
-        let filter = ResonantLpf::new(2000.0, 6000.0, 0.15, 0.03, sample_rate, rng);
-        Self {
-            noise: Xorshift64::new(rng.r#gen::<u64>() | 1),
-            filter,
-            lfo_phase: rng.r#gen::<f32>(),
-            lfo_rate: rng.r#gen_range(0.02..0.06),
-            base_level: 0.08,
-            sample_rate,
-        }
-    }
-
-    fn next_sample(&mut self) -> f32 {
-        let noise = self.noise.white();
-        let filtered = self.filter.process(noise);
-
-        // Slow breathing LFO
-        let lfo = (self.lfo_phase * std::f32::consts::TAU).sin();
-        let level = self.base_level * (0.5 + 0.5 * lfo);
-
-        self.lfo_phase += self.lfo_rate / self.sample_rate;
-        if self.lfo_phase >= 1.0 {
-            self.lfo_phase -= 1.0;
-        }
-
-        filtered * level
-    }
-
-    fn set_level(&mut self, level: f32) {
-        self.base_level = level;
-    }
-}
-
-
 /// Dub stab: 2-3 detuned saw/triangle oscillators forming a chord,
 /// with fast attack, band-pass filtered (decaying LPF + fixed HPF),
 /// and fed through dub delay.
@@ -1087,12 +1041,6 @@ impl ClaveVoice {
         Self { phase: 0.0, amp: 0.0, freq: 2500.0, sample_rate }
     }
 
-    /// Trigger at the default 2500 Hz.
-    fn trigger(&mut self) {
-        self.amp = 1.0;
-        self.phase = 0.0;
-    }
-
     /// Trigger at a specific musical note, e.g. `"A6"`, `"C#5"`, `"Bb4"`.
     fn trigger_with_note(&mut self, note: &str) {
         self.freq = Self::note_to_freq(note);
@@ -1289,8 +1237,6 @@ const BASE_FREQ: f32 = 1.2;
 /// Polyrhythmic ratios (p/q of base frequency).
 /// Chosen so LCM of denominators creates long resolution period.
 const RIM_RATIO: (f32, f32) = (9.0, 5.0);    // 9/5 base → 2.160 Hz — drifts against kick
-const STAB_RATIO: (f32, f32) = (3.0, 5.0);   // 3/5 base
-const GRAIN_RATIO: (f32, f32) = (1.0, 7.0);   // 1/7 base
 
 impl AmbientTechno {
     pub fn new(sample_rate: u32, seed: u64) -> Self {
