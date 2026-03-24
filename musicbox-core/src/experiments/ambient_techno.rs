@@ -885,6 +885,11 @@ pub struct MonoSynth {
     filter_env: f32,     // 0..1, decays after each trigger
     filter_env_decay: f32,
     sweep_phase: f32,    // 0..1, advances by 1/64 per trigger — slow LPF sweep
+    cutoff_min: f32,     // Hz — LPF base cutoff lower bound
+    cutoff_sweep_range: f32, // Hz — how far the sweep opens the filter above cutoff_min
+    cutoff_peak: f32,    // Hz — maximum cutoff reached at full filter_env
+    resonance: f32,
+    portamento: f32,     // exponential glide coefficient per sample (smaller = slower)
     sample_rate: f32,
 }
 
@@ -907,13 +912,46 @@ impl MonoSynth {
             filter_env: 0.0,
             filter_env_decay: (-1.0 / (sample_rate * 0.05_f32)).exp(), // ~50ms filter sweep
             sweep_phase: 0.0,
+            cutoff_min: 40.0,
+            cutoff_sweep_range: 210.0, // 40–250 Hz
+            cutoff_peak: 400.0,
+            resonance: 0.7,
+            portamento: 0.005,
+            sample_rate,
+        }
+    }
+
+    /// Bass variant: lower cutoff, lower resonance, longer decay — thick and rounded.
+    pub fn new_bass(sample_rate: f32) -> Self {
+        Self {
+            phase: 0.0,
+            sub_phase: 0.0,
+            freq: 110.0,
+            target_freq: 110.0,
+            amp: 0.0,
+            amp_peak: 0.6,
+            amp_attack_rate: 0.6 / (sample_rate * 0.025_f32), // ~25ms attack
+            amp_decay: (-1.0 / (sample_rate * 0.12_f32)).exp(), // ~120ms note decay
+            attacking: false,
+            lp1_low: 0.0,
+            lp1_band: 0.0,
+            lp2_low: 0.0,
+            lp2_band: 0.0,
+            filter_env: 0.0,
+            filter_env_decay: (-1.0 / (sample_rate * 0.08_f32)).exp(), // ~80ms filter sweep
+            sweep_phase: 0.0,
+            cutoff_min: 120.0,
+            cutoff_sweep_range: 120.0, // 120–240 Hz
+            cutoff_peak: 300.0,
+            resonance: 0.25,
+            portamento: 0.001,
             sample_rate,
         }
     }
 
     pub fn trigger(&mut self, freq: f32, accented: bool) {
         self.target_freq = freq;
-        self.amp = 0.0;
+        // Don't reset amp to 0 — retrigger from current level to avoid a click.
         self.amp_peak = if accented { 1.0 } else { 0.6 };
         self.attacking = true;
         self.filter_env = if accented { 1.3 } else { 1.0 }; // accent also opens filter wider
@@ -927,7 +965,7 @@ impl MonoSynth {
         }
 
         // Portamento: exponential glide toward target frequency
-        self.freq += (self.target_freq - self.freq) * 0.005;
+        self.freq += (self.target_freq - self.freq) * self.portamento;
 
         // Sawtooth main oscillator (SH-101 style)
         let main = 1.0 - 2.0 * self.phase;
@@ -942,13 +980,11 @@ impl MonoSynth {
         let osc = main * 0.7 + sub * 0.3;
 
         // Cascaded 4-pole resonant low-pass (two SVF stages)
-        // base_cutoff sweeps 80–2500 Hz over a 64-note sine cycle
         let sweep = (self.sweep_phase * std::f32::consts::TAU).sin() * 0.5 + 0.5; // 0..1
-        let base_cutoff = 40.0_f32 + sweep * 210.0; // 40–250 Hz
-        let peak_cutoff: f32 = 400.0;
-        let cutoff = base_cutoff + self.filter_env * (peak_cutoff - base_cutoff);
+        let base_cutoff = self.cutoff_min + sweep * self.cutoff_sweep_range;
+        let cutoff = base_cutoff + self.filter_env * (self.cutoff_peak - base_cutoff);
         let f = (std::f32::consts::PI * cutoff / self.sample_rate).sin() * 2.0;
-        let resonance = 0.7_f32;
+        let resonance = self.resonance;
 
         let high1 = osc - self.lp1_low - resonance * self.lp1_band;
         self.lp1_band += f * high1;
@@ -1090,6 +1126,15 @@ impl ClaveVoice {
     }
 }
 
+/// Fixed 32-step bassline (8 beats / 2 bars). None = rest.
+/// Repeating Am figure ending with F3 on the last group.
+const BASSLINE_PATTERN: [Option<f32>; 32] = [
+    Some(110.00), Some(55.00), Some(110.00), Some(130.81), None, Some(82.41), None, None, // beats 1–2
+    Some(110.00), Some(55.00), Some(110.00), Some(130.81), None, Some(82.41), None, None, // beats 3–4
+    Some(110.00), Some(55.00), Some(110.00), Some(130.81), None, Some(82.41), None, None, // beats 5–6
+    Some(110.00), Some(55.00), Some(110.00), Some(130.81), None, Some(61.74), None, None, // beats 7–8 (B2)
+];
+
 // Pattern indices
 const PATTERN_KICK:  usize = 0;
 const PATTERN_SNARE: usize = 1;
@@ -1100,8 +1145,9 @@ const PATTERN_STAB2: usize = 5;
 const PATTERN_STAB3: usize = 6;
 const PATTERN_PAD:   usize = 7;
 const PATTERN_MONO:  usize = 8;
-const PATTERN_CLAVE: usize = 9;
-const NUM_PATTERNS:  usize = 10;
+const PATTERN_CLAVE:    usize = 9;
+const PATTERN_BASSLINE: usize = 10;
+const NUM_PATTERNS:     usize = 11;
 
 /// One instrument group. Config fields are set once; runtime fields track playback state.
 #[derive(Clone, Copy)]
@@ -1215,6 +1261,9 @@ pub struct AmbientTechno {
     clave_delay: DubDelay,
     clave_reverb: DattorroReverb,
     clave_timer: Option<u32>,
+    bass: MonoSynth,
+    bass_reverb: DattorroReverb,
+    bassline_downbeat_timer: Option<u32>,
     patterns: [Pattern; NUM_PATTERNS],
     pattern_rng: Xorshift64,
     sample_rate: f32,
@@ -1318,6 +1367,9 @@ impl AmbientTechno {
             clave_delay: DubDelay::new(416.0, 0.45, 0.3, sr),
             clave_reverb: DattorroReverb::new(0.93, 0.7, 0.85, 0.04, sr, &mut rng),
             clave_timer: None,
+            bass: MonoSynth::new_bass(sr),
+            bass_reverb: DattorroReverb::new(0.6, 0.2, 0.5, 0.05, sr, &mut rng),
+            bassline_downbeat_timer: None,
             // Placeholder weights — caller will configure via set_pattern() before first use.
             patterns: [
                 Pattern::new(0.2, 0.6, 4, false), // PATTERN_KICK
@@ -1329,7 +1381,8 @@ impl AmbientTechno {
                 Pattern::new(0.7, 0.3, 16, true), // PATTERN_STAB3
                 Pattern::new(0.2, 0.4, 8, true),  // PATTERN_PAD
                 Pattern::new(0.1, 0.3, 8, true),  // PATTERN_MONO
-                Pattern::new(0.1, 0.3, 2, false),  // PATTERN_CLAVE
+                Pattern::new(0.1, 0.3, 2, false),   // PATTERN_CLAVE
+                Pattern::new(0.1, 0.4, 4, true),    // PATTERN_BASSLINE
             ],
             pattern_rng: Xorshift64::new(rng.r#gen::<u64>() | 1),
             sample_rate: sr,
@@ -1498,6 +1551,9 @@ impl AmbientTechno {
             if self.patterns[PATTERN_MONO].active {
                 self.mono_downbeat_timer = Some(sw);
             }
+            if self.patterns[PATTERN_BASSLINE].active {
+                self.bassline_downbeat_timer = Some(sw);
+            }
             let sixteenth = self.beat_duration / 4;
             self.open_hat_position = self.beat_duration / 2 + sw;
             self.closed_hat_positions = [sixteenth + sw, sixteenth * 2, sixteenth * 3 + sw];
@@ -1555,6 +1611,13 @@ impl AmbientTechno {
         tick_timer!(self.mono_downbeat_timer, {
             self.mono.trigger(self.mono_seq_freqs[self.mono_step], self.mono_step % 3 == 0);
             self.advance_mono_step();
+        });
+
+        tick_timer!(self.bassline_downbeat_timer, {
+            let step = ((self.beat_count.wrapping_sub(1)) % 8 * 4) as usize;
+            if let Some(freq) = BASSLINE_PATTERN[step] {
+                self.bass.trigger(freq, false);
+            }
         });
 
         tick_timer!(self.ghost_timer, {
@@ -1616,6 +1679,21 @@ impl AmbientTechno {
         if self.patterns[PATTERN_MONO].active && at_closed_hat_pos {
             self.mono.trigger(self.mono_seq_freqs[self.mono_step], self.mono_step % 3 == 0);
             self.advance_mono_step();
+        }
+
+        // Bassline off-beat 16ths: steps 1, 2, 3 within each beat.
+        if self.patterns[PATTERN_BASSLINE].active {
+            let base = ((self.beat_count.wrapping_sub(1)) % 8 * 4) as usize;
+            let step_offset =
+                if self.beat_phase == self.closed_hat_positions[0] { Some(1) }
+                else if self.beat_phase == self.closed_hat_positions[1] { Some(2) }
+                else if self.beat_phase == self.closed_hat_positions[2] { Some(3) }
+                else { None };
+            if let Some(off) = step_offset {
+                if let Some(freq) = BASSLINE_PATTERN[base + off] {
+                    self.bass.trigger(freq, false);
+                }
+            }
         }
 
         // On the last beat of every 2-measure cycle, fire a roll of 8 evenly spaced closed hats.
@@ -1680,10 +1758,14 @@ impl AmbientTechno {
         let clave_dry = self.clave.next_sample();
         let (clave_dl, clave_dr) = self.clave_delay.process(clave_dry);
         let (clave_l, clave_r) = self.clave_reverb.process((clave_dl + clave_dr) * 0.5);
+        let bass_dry = self.bass.next_sample();
+        let (bass_rev_l, bass_rev_r) = self.bass_reverb.process(bass_dry);
+        let bass_l = bass_dry + bass_rev_l * 0.08;
+        let bass_r = bass_dry + bass_rev_r * 0.08;
 
         // Kick centre, snare centre, hat panned slightly left, closed hat centre, rim slightly right, stabs, pad and mono centre
-        let mut left = kick + snare_l * 0.425 + ghost_snare_l * 0.3 + rev_rev_l * 0.25 + hat_l * 0.7 + rim_l * 0.8 + stab_l * 0.6 + stab2_l * 0.6 + stab3_l * 0.7 + pad_l + mono_l * 0.09375 + clave_l * 0.5;
-        let mut right = kick + snare_r * 0.425 + ghost_snare_r * 0.3 + rev_rev_r * 0.25 + hat_r * 0.7 + rim_r * 0.8 + stab_r * 0.6 + stab2_r * 0.6 + stab3_r * 0.7 + pad_r + mono_r * 0.09375 + clave_r * 0.5;
+        let mut left = kick + snare_l * 0.425 + ghost_snare_l * 0.3 + rev_rev_l * 0.25 + hat_l * 0.7 + rim_l * 0.8 + stab_l * 0.6 + stab2_l * 0.6 + stab3_l * 0.7 + pad_l + mono_l * 0.09375 + clave_l * 0.5 + bass_l * 0.09;
+        let mut right = kick + snare_r * 0.425 + ghost_snare_r * 0.3 + rev_rev_r * 0.25 + hat_r * 0.7 + rim_r * 0.8 + stab_r * 0.6 + stab2_r * 0.6 + stab3_r * 0.7 + pad_r + mono_r * 0.09375 + clave_r * 0.5 + bass_r * 0.09;
 
         // Peak limiter
         let peak = left.abs().max(right.abs());
