@@ -1,6 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use musicbox_core::{MusicBox, State, parse_duration};
-use musicbox_core::experiments::ambient_techno::{AmbientTechno, FadeState};
+use musicbox_core::{MusicBox, State, Track, parse_duration};
+use musicbox_core::tracks::ambient_techno::AmbientTechno;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -227,15 +227,15 @@ fn run_live_techno() {
     let callback = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
         let sig_state = master_state_cb.load(Ordering::Relaxed);
         if sig_state == STATE_FADING_OUT
-            && engine.state() != FadeState::FadingOut
-            && engine.state() != FadeState::Done
+            && engine.state() != State::FadingOut
+            && engine.state() != State::Done
         {
             engine.start_fade_out();
         }
 
         match engine.state() {
-            FadeState::Playing => master_state_cb.store(STATE_PLAYING, Ordering::Relaxed),
-            FadeState::Done => master_state_cb.store(STATE_DONE, Ordering::Relaxed),
+            State::Playing => master_state_cb.store(STATE_PLAYING, Ordering::Relaxed),
+            State::Done => master_state_cb.store(STATE_DONE, Ordering::Relaxed),
             _ => {}
         }
 

@@ -1,6 +1,6 @@
 use wasm_bindgen::prelude::*;
-use musicbox_core::MusicBox;
-use musicbox_core::experiments::ambient_techno::AmbientTechno;
+use musicbox_core::{MusicBox, Track};
+use musicbox_core::tracks::ambient_techno::AmbientTechno;
 
 /// WASM wrapper around the MusicBox DSP engine.
 /// Holds the engine and a persistent interleaved output buffer.

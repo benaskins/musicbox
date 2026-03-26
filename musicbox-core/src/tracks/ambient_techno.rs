@@ -1,7 +1,11 @@
 use rand::Rng;
 use rand::SeedableRng;
 
-use crate::dsp::{BbdDelay, DattorroReverb, Phaser, ResonantLpf};
+use crate::effects::{BbdDelay, DattorroReverb, DubDelay, Phaser, ResonantLpf};
+use crate::instruments::{ClaveVoice, DubStab, HiHat, Kick, MonoSynth, Snare808, SynthPad};
+use crate::clocks::{PulseOscillator, SwingLfo};
+use crate::util::prng::Xorshift64;
+use crate::track::{State, Track};
 
 /// Counts down an `Option<u32>` timer and runs `$body` when it hits zero.
 macro_rules! tick_timer {
@@ -15,937 +19,6 @@ macro_rules! tick_timer {
             }
         }
     };
-}
-
-/// A sub-Hz oscillator that emits trigger events each cycle.
-/// Phase accumulates from 0.0 to 1.0; a trigger fires when it wraps.
-pub struct PulseOscillator {
-    phase: f32,
-    freq: f32,
-    sample_rate: f32,
-}
-
-impl PulseOscillator {
-    pub fn new(freq: f32, sample_rate: f32) -> Self {
-        Self {
-            phase: 0.0,
-            freq,
-            sample_rate,
-        }
-    }
-
-    pub fn new_with_phase(freq: f32, sample_rate: f32, phase: f32) -> Self {
-        Self {
-            phase,
-            freq,
-            sample_rate,
-        }
-    }
-
-    /// Advance one sample. Returns true on the sample where phase wraps.
-    pub fn tick(&mut self) -> bool {
-        self.phase += self.freq / self.sample_rate;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn set_freq(&mut self, freq: f32) {
-        self.freq = freq;
-    }
-
-    pub fn freq(&self) -> f32 {
-        self.freq
-    }
-}
-
-/// A slow-evolving sine LFO that produces a swing (shuffle) timing offset in samples.
-///
-/// Phase advances by 1/32 per beat, completing one full sine cycle every 32 beats (~27s at 72 BPM).
-/// Call `advance()` once per kick; call `offset_samples(beat_duration)` anywhere a swing nudge is needed.
-pub struct SwingLfo {
-    phase: f32, // 0..1, wraps every 32 beats
-}
-
-impl SwingLfo {
-    pub fn new() -> Self {
-        Self { phase: 0.0 }
-    }
-
-    /// Advance one beat. Call this on every kick trigger.
-    pub fn advance(&mut self) {
-        self.phase += 1.0 / 32.0;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
-        }
-    }
-
-    /// Current swing delay in samples. Off-beat positions should be delayed by this amount.
-    /// Range: 0 ..= beat_duration / 12.
-    pub fn offset_samples(&self, beat_duration: u32) -> u32 {
-        let max_swing = beat_duration / 4 / 3;
-        let t = (self.phase * std::f32::consts::TAU).sin() * 0.5 + 0.5; // 0..1
-        let t = 0.75 + t * 0.25; // remap to 0.75..1.0 — never fully straight
-        (t * max_swing as f32) as u32
-    }
-}
-
-/// Synthesized kick drum.
-/// Sine body with exponential pitch envelope: starts at `pitch_start` Hz,
-/// decays to `pitch_end` Hz. Amplitude decays exponentially.
-pub struct Kick {
-    phase: f32,
-    pitch_start: f32,
-    pitch_end: f32,
-    pitch_decay: f32,
-    amp_decay: f32,
-    current_pitch: f32,
-    current_pitch_end: f32,
-    current_amp: f32,
-    sample_rate: f32,
-    active: bool,
-}
-
-impl Kick {
-    pub fn new(sample_rate: f32) -> Self {
-        Self {
-            phase: 0.0,
-            pitch_start: 110.0,
-            pitch_end: 50.0,
-            pitch_decay: 0.995,
-            amp_decay: 0.9995,
-            current_pitch: 50.0,
-            current_pitch_end: 50.0,
-            current_amp: 0.0,
-            sample_rate,
-            active: false,
-        }
-    }
-
-    /// Ghost kick: same pitch shape but half the decay rate (double length).
-    pub fn new_ghost(sample_rate: f32) -> Self {
-        Self {
-            amp_decay: 0.9995_f32.powf(0.25), // decays to silence in ~4× the time of a normal kick
-            ..Self::new(sample_rate)
-        }
-    }
-
-    /// Fire the kick — resets envelope.
-    pub fn trigger(&mut self) {
-        self.trigger_with_amp(1.0);
-    }
-
-    /// Fire with a specific peak amplitude.
-    pub fn trigger_with_amp(&mut self, amp: f32) {
-        self.trigger_with_amp_and_pitch(amp, 1.0);
-    }
-
-    /// Fire with a specific amplitude and pitch multiplier (both start and end pitch scale together).
-    pub fn trigger_with_amp_and_pitch(&mut self, amp: f32, pitch_mul: f32) {
-        self.phase = 0.0;
-        self.current_pitch = self.pitch_start * pitch_mul;
-        self.current_pitch_end = self.pitch_end * pitch_mul;
-        self.current_amp = amp;
-        self.active = true;
-    }
-
-    /// Generate next sample.
-    pub fn next_sample(&mut self) -> f32 {
-        if !self.active {
-            return 0.0;
-        }
-
-        let sample = (self.phase * std::f32::consts::TAU).sin();
-
-        self.phase += self.current_pitch / self.sample_rate;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
-        }
-
-        // Exponential pitch decay toward current_pitch_end
-        self.current_pitch = self.current_pitch_end
-            + (self.current_pitch - self.current_pitch_end) * self.pitch_decay;
-
-        // Exponential amplitude decay
-        self.current_amp *= self.amp_decay;
-        if self.current_amp < 0.001 {
-            self.active = false;
-            self.current_amp = 0.0;
-        }
-
-        // Soft clip for punch
-        (sample * self.current_amp * 1.5).tanh()
-    }
-}
-
-/// Roland TR-808 style snare: two detuned sine bodies with fast pitch drop,
-/// plus bright band-passed noise. Both components have independent amplitude envelopes.
-pub struct Snare808 {
-    // Dual sine body (detuned pair — characteristic of the 808 circuit)
-    tone1_phase: f32,
-    tone2_phase: f32,
-    tone1_pitch: f32,      // current pitch of oscillator 1
-    tone2_pitch: f32,      // current pitch of oscillator 2
-    tone1_pitch_end: f32,
-    tone2_pitch_end: f32,
-    tone_pitch_decay: f32, // shared per-sample pitch decay factor
-    tone_amp: f32,
-    tone_amp_decay: f32,
-    // Noise
-    noise: Xorshift64,
-    noise_amp: f32,
-    noise_amp_decay: f32,
-    noise_bp_low: f32,     // SVF band-pass state
-    noise_bp_band: f32,
-    // Transient crack (very short broadband burst for snappiness)
-    crack_amp: f32,
-    crack_amp_decay: f32,
-    // Shared
-    active: bool,
-    sample_rate: f32,
-}
-
-impl Snare808 {
-    pub fn new(sample_rate: f32, seed: u64) -> Self {
-        Self {
-            tone1_phase: 0.0,
-            tone2_phase: 0.0,
-            tone1_pitch: 80.0,
-            tone2_pitch: 70.0,
-            tone1_pitch_end: 80.0,
-            tone2_pitch_end: 70.0,
-            tone_pitch_decay: 0.993, // fast sweep — mostly settles in ~15ms
-            tone_amp: 0.0,
-            tone_amp_decay: (-1.0 / (sample_rate * 0.025_f32)).exp(), // ~25ms body
-            noise: Xorshift64::new(seed),
-            noise_amp: 0.0,
-            noise_amp_decay: (-1.0 / (sample_rate * 0.03_f32)).exp(), // ~30ms noise tail
-            noise_bp_low: 0.0,
-            noise_bp_band: 0.0,
-            crack_amp: 0.0,
-            crack_amp_decay: (-1.0 / (sample_rate * 0.005_f32)).exp(), // ~5ms
-            active: false,
-            sample_rate,
-        }
-    }
-
-    fn reset_phases(&mut self) {
-        self.tone1_phase = 0.0;
-        self.tone2_phase = 0.0;
-        self.tone1_pitch = 200.0; // sweeps 200 → 80 Hz
-        self.tone2_pitch = 175.0; // sweeps 175 → 70 Hz (detuned pair)
-        self.noise_bp_low = 0.0;
-        self.noise_bp_band = 0.0;
-        self.active = true;
-    }
-
-    pub fn trigger(&mut self) {
-        self.reset_phases();
-        self.tone_amp = 0.15;
-        self.noise_amp = 0.50;
-        self.crack_amp = 0.3;
-    }
-
-    /// Ghost hit: half the amplitude of a full trigger.
-    pub fn trigger_ghost(&mut self) {
-        self.reset_phases();
-        self.tone_amp = 0.12;
-        self.noise_amp = 0.25;
-        self.crack_amp = 0.15;
-    }
-
-    pub fn next_sample(&mut self) -> f32 {
-        if !self.active {
-            return 0.0;
-        }
-
-        // Dual sine body
-        let t1 = (self.tone1_phase * std::f32::consts::TAU).sin();
-        self.tone1_phase += self.tone1_pitch / self.sample_rate;
-        if self.tone1_phase >= 1.0 { self.tone1_phase -= 1.0; }
-        self.tone1_pitch = self.tone1_pitch_end
-            + (self.tone1_pitch - self.tone1_pitch_end) * self.tone_pitch_decay;
-
-        let t2 = (self.tone2_phase * std::f32::consts::TAU).sin();
-        self.tone2_phase += self.tone2_pitch / self.sample_rate;
-        if self.tone2_phase >= 1.0 { self.tone2_phase -= 1.0; }
-        self.tone2_pitch = self.tone2_pitch_end
-            + (self.tone2_pitch - self.tone2_pitch_end) * self.tone_pitch_decay;
-
-        let tone = (t1 + t2) * 0.5 * self.tone_amp;
-        self.tone_amp *= self.tone_amp_decay;
-
-        // Bright band-passed noise (SVF, ~2 kHz centre)
-        let white = self.noise.white();
-        let f = (std::f32::consts::PI * 2000.0 / self.sample_rate).sin() * 2.0;
-        let q = 0.4;
-        let high = white - self.noise_bp_low - q * self.noise_bp_band;
-        self.noise_bp_band += f * high;
-        self.noise_bp_low += f * self.noise_bp_band;
-        let snap = self.noise_bp_band * self.noise_amp;
-        self.noise_amp *= self.noise_amp_decay;
-
-        // Transient crack: broadband white noise burst, decays in ~5ms
-        let crack = self.noise.white() * self.crack_amp;
-        self.crack_amp *= self.crack_amp_decay;
-
-        if self.tone_amp < 0.001 && self.noise_amp < 0.001 && self.crack_amp < 0.001 {
-            self.active = false;
-        }
-
-        (tone + snap + crack).tanh()
-    }
-}
-
-/// Xorshift64 PRNG for cheap per-sample noise.
-/// Deterministic given a seed, no allocation.
-pub struct Xorshift64 {
-    state: u64,
-}
-
-impl Xorshift64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed | 1 }
-    }
-
-    #[inline]
-    fn next(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
-    }
-
-    /// White noise sample in [-1.0, 1.0].
-    #[inline]
-    fn white(&mut self) -> f32 {
-        (self.next() as f32) / (u64::MAX as f32) * 2.0 - 1.0
-    }
-}
-
-/// Hi-hat: band-passed noise burst with fast exponential decay.
-/// Triggered by a pulse oscillator.
-pub struct HiHat {
-    noise: Xorshift64,
-    amp: f32,
-    peak_amp: f32,
-    decay: f32,
-    /// Band-pass state (simple 2-pole)
-    bp_low: f32,
-    bp_band: f32,
-    bp_freq: f32,
-    sample_rate: f32,
-}
-
-impl HiHat {
-    pub fn new(sample_rate: f32, seed: u64) -> Self {
-        Self {
-            noise: Xorshift64::new(seed),
-            amp: 0.0,
-            peak_amp: 0.15,
-            decay: (-1.0 / (sample_rate * 0.03_f32)).exp(), // ~30ms decay
-            bp_low: 0.0,
-            bp_band: 0.0,
-            bp_freq: 8000.0,
-            sample_rate,
-        }
-    }
-
-    /// Closed hi-hat: very short decay, high BP frequency.
-    pub fn new_closed(sample_rate: f32, seed: u64) -> Self {
-        Self {
-            noise: Xorshift64::new(seed),
-            amp: 0.0,
-            peak_amp: 0.009375, // 1/16 of open hat's 0.15
-            decay: (-1.0 / (sample_rate * 0.008_f32)).exp(), // ~8ms decay
-            bp_low: 0.0,
-            bp_band: 0.0,
-            bp_freq: 10000.0,
-            sample_rate,
-        }
-    }
-
-    /// Rim-shot variant: lower, clickier, shorter decay than a hat.
-    pub fn new_rim(sample_rate: f32, seed: u64) -> Self {
-        Self {
-            noise: Xorshift64::new(seed),
-            amp: 0.0,
-            peak_amp: 0.09,
-            decay: (-1.0 / (sample_rate * 0.015_f32)).exp(), // ~15ms decay
-            bp_low: 0.0,
-            bp_band: 0.0,
-            bp_freq: 3000.0,
-            sample_rate,
-        }
-    }
-
-    pub fn trigger(&mut self) {
-        self.amp = self.peak_amp;
-    }
-
-    pub fn next_sample(&mut self) -> f32 {
-        if self.amp < 0.0001 {
-            self.amp = 0.0;
-            return 0.0;
-        }
-
-        let noise = self.noise.white();
-
-        // Simple SVF band-pass for metallic character
-        let f = (std::f32::consts::PI * self.bp_freq / self.sample_rate).sin() * 2.0;
-        let q = 0.4;
-        let high = noise - self.bp_low - q * self.bp_band;
-        self.bp_band += f * high;
-        self.bp_low += f * self.bp_band;
-        let bp_out = self.bp_band;
-
-        self.amp *= self.decay;
-
-        bp_out * self.amp
-    }
-}
-
-/// Dub stab: 2-3 detuned saw/triangle oscillators forming a chord,
-/// with fast attack, band-pass filtered (decaying LPF + fixed HPF),
-/// and fed through dub delay.
-pub struct DubStab {
-    phases: [f32; 3],
-    freqs: [f32; 3],
-    /// 0.0 = saw, 1.0 = triangle (blends between them)
-    wave_blend: f32,
-    amp: f32,
-    decay: f32,
-    /// LPF state (decaying cutoff — each stab opens and closes)
-    lp_low: f32,
-    lp_band: f32,
-    lp_cutoff: f32,
-    lp_decay: f32,
-    /// HPF state (fixed cutoff — removes mud)
-    hp_low: f32,
-    hp_band: f32,
-    hp_cutoff: f32,
-    sample_rate: f32,
-    active: bool,
-}
-
-impl DubStab {
-    pub fn new(sample_rate: f32) -> Self {
-        Self {
-            phases: [0.0; 3],
-            freqs: [0.0; 3],
-            wave_blend: 0.4, // mostly saw with some triangle character
-            amp: 0.0,
-            decay: (-1.0 / (sample_rate * 0.35_f32)).exp(), // ~350ms decay
-            lp_low: 0.0,
-            lp_band: 0.0,
-            lp_cutoff: 800.0,
-            lp_decay: (-1.0 / (sample_rate * 0.25_f32)).exp(),
-            hp_low: 0.0,
-            hp_band: 0.0,
-            hp_cutoff: 250.0,
-            sample_rate,
-            active: false,
-        }
-    }
-
-    /// Long-decay variant: amplitude holds for ~4 beats (3.3s at 72 BPM), filter closes slowly.
-    pub fn new_long(sample_rate: f32) -> Self {
-        Self {
-            decay: (-1.0 / (sample_rate * 3.0_f32)).exp(),
-            lp_decay: (-1.0 / (sample_rate * 2.0_f32)).exp(),
-            ..Self::new(sample_rate)
-        }
-    }
-
-    /// Trigger with explicit chord tones, applying slight random detuning to each voice.
-    pub fn trigger_with_chord(&mut self, notes: [f32; 3], rng: &mut Xorshift64) {
-        self.trigger_with_chord_and_cutoff(notes, 2500.0, rng);
-    }
-
-    pub fn trigger_with_chord_and_cutoff(&mut self, notes: [f32; 3], initial_cutoff: f32, rng: &mut Xorshift64) {
-        self.freqs[0] = notes[0] * (1.0 + rng.white() * 0.008);
-        self.freqs[1] = notes[1] * (1.0 + rng.white() * 0.012);
-        self.freqs[2] = notes[2] * (1.0 + rng.white() * 0.010);
-        self.phases = [0.0; 3];
-        self.amp = 0.35;
-        self.lp_cutoff = initial_cutoff;
-        self.lp_low = 0.0;
-        self.lp_band = 0.0;
-        self.hp_low = 0.0;
-        self.hp_band = 0.0;
-        self.active = true;
-    }
-
-    /// Trigger a stab with a root frequency. Creates a minor chord (root, minor 3rd, 5th)
-    /// with slight detuning.
-    pub fn trigger(&mut self, root_freq: f32, rng: &mut Xorshift64) {
-        self.trigger_with_chord([root_freq, root_freq * 1.2, root_freq * 1.5], rng);
-    }
-
-    #[inline]
-    fn saw(phase: f32) -> f32 {
-        2.0 * phase - 1.0
-    }
-
-    #[inline]
-    fn triangle(phase: f32) -> f32 {
-        4.0 * (phase - (phase + 0.5).floor()).abs() - 1.0
-    }
-
-    pub fn next_sample(&mut self) -> f32 {
-        if !self.active {
-            return 0.0;
-        }
-
-        // Sum detuned saw/triangle oscillators
-        let mut sig = 0.0;
-        for i in 0..3 {
-            let s = Self::saw(self.phases[i]);
-            let t = Self::triangle(self.phases[i]);
-            sig += s + (t - s) * self.wave_blend;
-            self.phases[i] += self.freqs[i] / self.sample_rate;
-            if self.phases[i] >= 1.0 {
-                self.phases[i] -= 1.0;
-            }
-        }
-        sig *= self.amp / 3.0;
-
-        // LPF with decaying cutoff — stab opens bright then closes
-        let lp_f = (std::f32::consts::PI * self.lp_cutoff / self.sample_rate).sin() * 2.0;
-        let lp_q = 0.5;
-        let lp_high = sig - self.lp_low - lp_q * self.lp_band;
-        self.lp_band += lp_f * lp_high;
-        self.lp_low += lp_f * self.lp_band;
-
-        // HPF — fixed cutoff, removes mud
-        let hp_f = (std::f32::consts::PI * self.hp_cutoff / self.sample_rate).sin() * 2.0;
-        let hp_q = 0.5;
-        let hp_high = self.lp_low - self.hp_low - hp_q * self.hp_band;
-        self.hp_band += hp_f * hp_high;
-        self.hp_low += hp_f * self.hp_band;
-
-        self.amp *= self.decay;
-        self.lp_cutoff = 250.0 + (self.lp_cutoff - 250.0) * self.lp_decay;
-
-        if self.amp < 0.001 {
-            self.active = false;
-            self.amp = 0.0;
-        }
-
-        hp_high
-    }
-}
-
-/// Dub delay: long feedback delay with filtering in the feedback path.
-/// Classic dub style — repeats that darken and smear over time.
-struct DubDelay {
-    buffer: crate::dsp::DelayLine,
-    feedback: f32,
-    lp_state: f32,
-    lp_coeff: f32,
-    hp_state: f32,
-    hp_coeff: f32,
-    delay_samples: usize,
-    mix: f32,
-}
-
-impl DubDelay {
-    fn new(delay_ms: f32, feedback: f32, mix: f32, sample_rate: f32) -> Self {
-        let delay_samples = (delay_ms * sample_rate / 1000.0) as usize;
-        Self {
-            buffer: crate::dsp::DelayLine::new(delay_samples + 1),
-            feedback,
-            lp_state: 0.0,
-            lp_coeff: 0.35, // darkening LP in feedback
-            hp_state: 0.0,
-            hp_coeff: 0.05, // removes DC/sub buildup in feedback
-            delay_samples,
-            mix,
-        }
-    }
-
-    fn process(&mut self, input: f32) -> (f32, f32) {
-        let delayed = self.buffer.read_at(self.delay_samples);
-
-        // LP in feedback path — each repeat gets darker
-        self.lp_state += self.lp_coeff * (delayed - self.lp_state);
-        // HP in feedback path — prevents mud accumulation
-        let hp_in = self.lp_state;
-        self.hp_state += self.hp_coeff * (hp_in - self.hp_state);
-        let filtered = hp_in - self.hp_state;
-
-        let write = input + filtered * self.feedback;
-        self.buffer.write_and_advance(write);
-
-        // Stereo: dry left, wet right (classic dub ping-pong feel)
-        let dry = input * (1.0 - self.mix * 0.5);
-        let wet = delayed * self.mix;
-        (dry + wet * 0.4, dry + wet)
-    }
-}
-
-/// High synth pad: three detuned oscillators (sine/triangle blend) with a slow
-/// amplitude attack, an LFO-swept LPF, and plate reverb. Designed to float
-/// above the percussion and stabs. Notes are changed by calling `trigger`.
-/// High synth pad: four detuned sawtooth oscillators with vibrato, slow attack,
-/// LFO-swept LPF, and plate reverb. Detuning spread emulates a string ensemble.
-pub struct SynthPad {
-    phases: [f32; 4],
-    base_freqs: [f32; 4],
-    vibrato_phase: f32,
-    amp: f32,
-    attack_rate: f32,
-    release_rate: f32,
-    sustaining: bool,
-    sample_rate: f32,
-}
-
-impl SynthPad {
-    pub fn new(sample_rate: f32) -> Self {
-        Self {
-            phases: [0.0; 4],
-            base_freqs: [0.0; 4],
-            vibrato_phase: 0.0,
-            amp: 0.0,
-            attack_rate: 1.0 / (sample_rate * 2.0),  // 2s attack
-            release_rate: 1.0 / (sample_rate * 3.0), // 3s release
-            sustaining: false,
-            sample_rate,
-        }
-    }
-
-    /// Start a new note. Four voices spread at 0, +12, -12, +24 cents
-    /// to emulate a string section. Phase is preserved to avoid clicks.
-    pub fn trigger(&mut self, freq: f32) {
-        self.base_freqs[0] = freq;
-        self.base_freqs[1] = freq * 2_f32.powf( 12.0 / 1200.0);
-        self.base_freqs[2] = freq * 2_f32.powf(-12.0 / 1200.0);
-        self.base_freqs[3] = freq * 2_f32.powf( 24.0 / 1200.0);
-        self.sustaining = true;
-    }
-
-    /// Start a minor triad. Voices: root, minor third, perfect fifth, root+12 cents (for width).
-    pub fn trigger_minor_chord(&mut self, root: f32) {
-        let minor_third = root * 2_f32.powf(3.0 / 12.0);  // +3 semitones
-        let fifth       = root * 2_f32.powf(7.0 / 12.0);  // +7 semitones
-        self.base_freqs[0] = root;
-        self.base_freqs[1] = minor_third;
-        self.base_freqs[2] = fifth;
-        self.base_freqs[3] = root * 2_f32.powf(12.0 / 1200.0); // root +12 cents for width
-        self.sustaining = true;
-    }
-
-    pub fn release(&mut self) {
-        self.sustaining = false;
-    }
-
-    pub fn next_sample(&mut self) -> f32 {
-        if self.sustaining {
-            self.amp = (self.amp + self.attack_rate).min(0.028);
-        } else {
-            self.amp = (self.amp - self.release_rate).max(0.0);
-        }
-
-        if self.amp == 0.0 {
-            return 0.0;
-        }
-
-        // Vibrato: 5 Hz, ~4 cents depth
-        let vibrato = (self.vibrato_phase * std::f32::consts::TAU).sin() * 0.0023;
-        self.vibrato_phase += 5.0 / self.sample_rate;
-        if self.vibrato_phase >= 1.0 { self.vibrato_phase -= 1.0; }
-
-        let mut sig = 0.0f32;
-        for i in 0..4 {
-            let freq = self.base_freqs[i] * (1.0 + vibrato);
-            // Sawtooth wave: rich harmonic content like bowed strings
-            let saw = 2.0 * self.phases[i] - 1.0;
-            // Small triangle blend softens the harshest overtones
-            let tri = 4.0 * (self.phases[i] - (self.phases[i] + 0.5).floor()).abs() - 1.0;
-            sig += saw * 0.8 + tri * 0.2;
-            self.phases[i] += freq / self.sample_rate;
-            if self.phases[i] >= 1.0 { self.phases[i] -= 1.0; }
-        }
-
-        sig / 4.0 * self.amp
-    }
-}
-
-/// Granular engine tuned for deep space textures: long, slow grains at
-/// extreme frequencies (very high shimmer + very low rumble), sparse
-/// triggering, fed through long reverb with wide stereo.
-pub struct GranularEngine {
-    grains: Vec<Grain>,
-    noise: Xorshift64,
-    reverb: DattorroReverb,
-    sample_rate: f32,
-    level: f32,
-}
-
-struct Grain {
-    phase: f32,
-    freq: f32,
-    /// Slow pitch drift per grain — each grain glides slightly
-    drift: f32,
-    window_phase: f32,
-    window_rate: f32,
-    /// Per-grain stereo position (-1 to 1)
-    pan: f32,
-    active: bool,
-}
-
-impl Grain {
-    fn new() -> Self {
-        Self {
-            phase: 0.0,
-            freq: 0.0,
-            drift: 0.0,
-            window_phase: 0.0,
-            window_rate: 0.0,
-            pan: 0.0,
-            active: false,
-        }
-    }
-
-    fn trigger(&mut self, freq: f32, drift: f32, duration_samples: f32, pan: f32) {
-        self.phase = 0.0;
-        self.freq = freq;
-        self.drift = drift;
-        self.window_phase = 0.0;
-        self.window_rate = 1.0 / duration_samples;
-        self.pan = pan;
-        self.active = true;
-    }
-
-    fn next_sample(&mut self, sample_rate: f32) -> (f32, f32) {
-        if !self.active {
-            return (0.0, 0.0);
-        }
-
-        // Hann window
-        let window = 0.5 * (1.0 - (self.window_phase * std::f32::consts::TAU).cos());
-        let sample = (self.phase * std::f32::consts::TAU).sin() * window;
-
-        self.phase += self.freq / sample_rate;
-        if self.phase >= 1.0 {
-            self.phase -= 1.0;
-        }
-        // Slow pitch glide
-        self.freq += self.drift / sample_rate;
-
-        self.window_phase += self.window_rate;
-        if self.window_phase >= 1.0 {
-            self.active = false;
-        }
-
-        // Equal-power pan
-        let r = (self.pan + 1.0) * 0.5; // 0..1
-        let l_gain = (1.0 - r).sqrt();
-        let r_gain = r.sqrt();
-        (sample * l_gain, sample * r_gain)
-    }
-}
-
-/// Frequency pools for space grains — very high shimmer and deep sub rumble
-const GRAIN_FREQS_HIGH: [f32; 6] = [1800.0, 2400.0, 3200.0, 4200.0, 5600.0, 7000.0];
-const GRAIN_FREQS_LOW: [f32; 4] = [40.0, 55.0, 65.0, 80.0];
-
-impl GranularEngine {
-    pub fn new(sample_rate: f32, seed: u64, rng: &mut impl Rng) -> Self {
-        let grains = (0..6).map(|_| Grain::new()).collect();
-        Self {
-            grains,
-            noise: Xorshift64::new(seed),
-            reverb: DattorroReverb::new(0.95, 0.6, 0.85, 0.015, sample_rate, rng),
-            sample_rate,
-            level: 0.1,
-        }
-    }
-
-    pub fn set_level(&mut self, level: f32) {
-        self.level = level;
-    }
-
-    /// Spawn a single grain — called by the external pulse oscillator.
-    pub fn spawn_grain(&mut self) {
-        if let Some(grain) = self.grains.iter_mut().find(|g| !g.active) {
-            // Pick from high or low frequency pool (70% high shimmer, 30% sub)
-            let is_high = (self.noise.next() % 10) < 7;
-            let freq = if is_high {
-                GRAIN_FREQS_HIGH[(self.noise.next() as usize) % GRAIN_FREQS_HIGH.len()]
-            } else {
-                GRAIN_FREQS_LOW[(self.noise.next() as usize) % GRAIN_FREQS_LOW.len()]
-            };
-
-            // Long grains: 200ms–1.5s
-            let dur_ms = 200.0 + (self.noise.next() % 1300) as f32;
-            let dur_samples = dur_ms * self.sample_rate / 1000.0;
-
-            // Slow pitch drift: ±10 Hz/sec for high, ±2 Hz/sec for low
-            let drift_range = if is_high { 10.0 } else { 2.0 };
-            let drift = (self.noise.white()) * drift_range;
-
-            // Wide stereo placement
-            let pan = self.noise.white();
-
-            grain.trigger(freq, drift, dur_samples, pan);
-        }
-    }
-
-    /// Generate stereo audio from active grains through reverb.
-    pub fn next_sample(&mut self) -> (f32, f32) {
-        let mut sum_l = 0.0f32;
-        let mut sum_r = 0.0f32;
-        for grain in &mut self.grains {
-            let (l, r) = grain.next_sample(self.sample_rate);
-            sum_l += l;
-            sum_r += r;
-        }
-
-        // Feed mono sum through long reverb for depth
-        let mono = (sum_l + sum_r) * 0.5;
-        let (rev_l, rev_r) = self.reverb.process(mono);
-
-        (rev_l * self.level, rev_r * self.level)
-    }
-}
-
-/// SH-101 inspired monosynth: sine oscillator with sub-oscillator one octave down,
-/// through a cascaded 4-pole resonant low-pass (two SVF stages) with a decaying
-/// filter envelope and portamento glide.
-pub struct MonoSynth {
-    phase: f32,          // main oscillator
-    sub_phase: f32,      // sub-oscillator, one octave down
-    freq: f32,           // current frequency (glides toward target)
-    target_freq: f32,
-    amp: f32,
-    amp_peak: f32,       // 0.6 normal, 1.0 accented
-    amp_attack_rate: f32,
-    amp_decay: f32,
-    attacking: bool,
-    // Stage 1 SVF
-    lp1_low: f32,
-    lp1_band: f32,
-    // Stage 2 SVF (cascaded for 4-pole response)
-    lp2_low: f32,
-    lp2_band: f32,
-    filter_env: f32,     // 0..1, decays after each trigger
-    filter_env_decay: f32,
-    sweep_phase: f32,    // 0..1, advances by 1/64 per trigger — slow LPF sweep
-    cutoff_min: f32,     // Hz — LPF base cutoff lower bound
-    cutoff_sweep_range: f32, // Hz — how far the sweep opens the filter above cutoff_min
-    cutoff_peak: f32,    // Hz — maximum cutoff reached at full filter_env
-    resonance: f32,
-    portamento: f32,     // exponential glide coefficient per sample (smaller = slower)
-    sample_rate: f32,
-}
-
-impl MonoSynth {
-    pub fn new(sample_rate: f32) -> Self {
-        Self {
-            phase: 0.0,
-            sub_phase: 0.0,
-            freq: 110.0,
-            target_freq: 110.0,
-            amp: 0.0,
-            amp_peak: 0.6,
-            amp_attack_rate: 0.6 / (sample_rate * 0.008_f32), // ~8ms attack (snappier)
-            amp_decay: (-1.0 / (sample_rate * 0.15_f32)).exp(), // ~150ms note decay
-            attacking: false,
-            lp1_low: 0.0,
-            lp1_band: 0.0,
-            lp2_low: 0.0,
-            lp2_band: 0.0,
-            filter_env: 0.0,
-            filter_env_decay: (-1.0 / (sample_rate * 0.05_f32)).exp(), // ~50ms filter sweep
-            sweep_phase: 0.0,
-            cutoff_min: 40.0,
-            cutoff_sweep_range: 210.0, // 40–250 Hz
-            cutoff_peak: 400.0,
-            resonance: 0.7,
-            portamento: 0.005,
-            sample_rate,
-        }
-    }
-
-    /// Bass variant: lower cutoff, lower resonance, longer decay — thick and rounded.
-    pub fn new_bass(sample_rate: f32) -> Self {
-        Self {
-            amp_attack_rate: 0.6 / (sample_rate * 0.025_f32), // ~25ms attack
-            amp_decay: (-1.0 / (sample_rate * 0.12_f32)).exp(), // ~120ms note decay
-            filter_env_decay: (-1.0 / (sample_rate * 0.08_f32)).exp(), // ~80ms filter sweep
-            cutoff_min: 120.0,
-            cutoff_sweep_range: 120.0, // 120–240 Hz
-            cutoff_peak: 300.0,
-            resonance: 0.25,
-            portamento: 0.001,
-            ..Self::new(sample_rate)
-        }
-    }
-
-    pub fn trigger(&mut self, freq: f32, accented: bool) {
-        self.target_freq = freq;
-        // Don't reset amp to 0 — retrigger from current level to avoid a click.
-        self.amp_peak = if accented { 1.0 } else { 0.6 };
-        self.attacking = true;
-        self.filter_env = if accented { 1.3 } else { 1.0 }; // accent also opens filter wider
-        self.sweep_phase += 1.0 / 64.0;
-        if self.sweep_phase >= 1.0 { self.sweep_phase -= 1.0; }
-    }
-
-    pub fn next_sample(&mut self) -> f32 {
-        if self.amp < 0.0001 && !self.attacking {
-            return 0.0;
-        }
-
-        // Portamento: exponential glide toward target frequency
-        self.freq += (self.target_freq - self.freq) * self.portamento;
-
-        // Sawtooth main oscillator (SH-101 style)
-        let main = 1.0 - 2.0 * self.phase;
-        self.phase += self.freq / self.sample_rate;
-        if self.phase >= 1.0 { self.phase -= 1.0; }
-
-        // Sub-oscillator: square wave one octave down
-        let sub = if self.sub_phase < 0.5 { 1.0_f32 } else { -1.0_f32 };
-        self.sub_phase += (self.freq * 0.5) / self.sample_rate;
-        if self.sub_phase >= 1.0 { self.sub_phase -= 1.0; }
-
-        let osc = main * 0.7 + sub * 0.3;
-
-        // Cascaded 4-pole resonant low-pass (two SVF stages)
-        let sweep = (self.sweep_phase * std::f32::consts::TAU).sin() * 0.5 + 0.5; // 0..1
-        let base_cutoff = self.cutoff_min + sweep * self.cutoff_sweep_range;
-        let cutoff = base_cutoff + self.filter_env * (self.cutoff_peak - base_cutoff);
-        let f = (std::f32::consts::PI * cutoff / self.sample_rate).sin() * 2.0;
-        let resonance = self.resonance;
-
-        let high1 = osc - self.lp1_low - resonance * self.lp1_band;
-        self.lp1_band += f * high1;
-        self.lp1_low += f * self.lp1_band;
-
-        let high2 = self.lp1_low - self.lp2_low - resonance * self.lp2_band;
-        self.lp2_band += f * high2;
-        self.lp2_low += f * self.lp2_band;
-
-        self.filter_env *= self.filter_env_decay;
-        if self.attacking {
-            self.amp += self.amp_attack_rate;
-            if self.amp >= self.amp_peak {
-                self.amp = self.amp_peak;
-                self.attacking = false;
-            }
-        } else {
-            self.amp *= self.amp_decay;
-        }
-
-        self.lp2_low * self.amp
-    }
 }
 
 // A natural minor scale, two octaves from A2
@@ -1012,53 +85,6 @@ const STAB3_CHORDS: [[f32; 3]; 5] = [
     [ 55.00,  73.42,  87.31], // Dm/A A1 D2 F2
 ];
 
-/// TR-808-style clave: decaying sine at ~2500 Hz, very short (~10 ms).
-/// TR-808-style clave. Default frequency is 2500 Hz; use `trigger_with_note` to tune it.
-struct ClaveVoice {
-    phase: f32,
-    amp: f32,
-    freq: f32,
-    sample_rate: f32,
-}
-
-impl ClaveVoice {
-    fn new(sample_rate: f32) -> Self {
-        Self { phase: 0.0, amp: 0.0, freq: 2500.0, sample_rate }
-    }
-
-    /// Trigger at a specific musical note, e.g. `"A6"`, `"C#5"`, `"Bb4"`.
-    fn trigger_with_note(&mut self, note: &str) {
-        self.freq = Self::note_to_freq(note);
-        self.amp = 1.0;
-        self.phase = 0.0;
-    }
-
-    /// Convert a note name ("A6", "C#5", "Bb4") to Hz via equal temperament (A4 = 440 Hz).
-    fn note_to_freq(note: &str) -> f32 {
-        let bytes = note.as_bytes();
-        let semitone: i32 = match bytes[0] {
-            b'C' => 0, b'D' => 2, b'E' => 4, b'F' => 5,
-            b'G' => 7, b'A' => 9, b'B' => 11, _ => 9,
-        };
-        let (accidental, octave_idx) = match bytes.get(1) {
-            Some(b'#') => (1i32, 2),
-            Some(b'b') => (-1i32, 2),
-            _ => (0i32, 1),
-        };
-        let octave = (bytes[octave_idx] - b'0') as i32;
-        let midi = (octave + 1) * 12 + semitone + accidental;
-        440.0 * 2.0_f32.powf((midi - 69) as f32 / 12.0)
-    }
-
-    fn next_sample(&mut self) -> f32 {
-        let out = (self.phase * std::f32::consts::TAU).sin() * self.amp;
-        self.phase += self.freq / self.sample_rate;
-        if self.phase >= 1.0 { self.phase -= 1.0; }
-        self.amp *= 0.993; // decays to ~5 % in 10 ms at 44100 Hz
-        out
-    }
-}
-
 /// Fixed 32-step bassline (8 beats / 2 bars). None = rest.
 /// Repeating Am figure ending with F3 on the last group.
 const BASSLINE_PATTERN: [Option<f32>; 32] = [
@@ -1107,6 +133,15 @@ impl Pattern {
         }
     }
 }
+
+const FADE_DURATION: f32 = 1.0;
+
+/// Human resting heartbeat — the base frequency from which all rhythms derive.
+const BASE_FREQ: f32 = 1.2;
+
+/// Polyrhythmic ratios (p/q of base frequency).
+/// Chosen so LCM of denominators creates long resolution period.
+const RIM_RATIO: (f32, f32) = (9.0, 5.0);    // 9/5 base → 2.160 Hz — drifts against kick
 
 /// Polyrhythmic ambient techno engine.
 ///
@@ -1202,26 +237,9 @@ pub struct AmbientTechno {
     sample_rate: f32,
     limiter_gain: f32,
     fade_pos: u32,
-    fade_state: FadeState,
+    fade_state: State,
     fade_samples: u32,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FadeState {
-    FadingIn,
-    Playing,
-    FadingOut,
-    Done,
-}
-
-const FADE_DURATION: f32 = 1.0;
-
-/// Human resting heartbeat — the base frequency from which all rhythms derive.
-const BASE_FREQ: f32 = 1.2;
-
-/// Polyrhythmic ratios (p/q of base frequency).
-/// Chosen so LCM of denominators creates long resolution period.
-const RIM_RATIO: (f32, f32) = (9.0, 5.0);    // 9/5 base → 2.160 Hz — drifts against kick
 
 impl AmbientTechno {
     pub fn new(sample_rate: u32, seed: u64) -> Self {
@@ -1319,7 +337,7 @@ impl AmbientTechno {
             sample_rate: sr,
             limiter_gain: 1.0,
             fade_pos: 0,
-            fade_state: FadeState::FadingIn,
+            fade_state: State::FadingIn,
             fade_samples: (sr * FADE_DURATION) as u32,
         };
         engine.update_patterns(); // initial pattern selection
@@ -1412,49 +430,26 @@ impl AmbientTechno {
         self.fade_pos as f32 / self.fade_samples as f32
     }
 
-    pub fn start_fade_out(&mut self) {
-        if self.fade_state == FadeState::FadingIn || self.fade_state == FadeState::Playing {
-            self.fade_state = FadeState::FadingOut;
-        }
-    }
-
-    pub fn is_done(&self) -> bool {
-        self.fade_state == FadeState::Done
-    }
-
-    pub fn state(&self) -> FadeState {
-        self.fade_state
-    }
-
     pub fn set_param(&mut self, _name: &str, _value: f32) {}
 
     pub fn get_params(&self) -> Vec<(&str, f32, f32, f32)> {
         vec![]
     }
 
-    pub fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let len = left.len().min(right.len());
-        for i in 0..len {
-            let (l, r) = self.next_sample();
-            left[i] = l;
-            right[i] = r;
-        }
-    }
-
     fn next_sample(&mut self) -> (f32, f32) {
         let master_gain = match self.fade_state {
-            FadeState::FadingIn => {
+            State::FadingIn => {
                 self.fade_pos += 1;
                 if self.fade_pos >= self.fade_samples {
-                    self.fade_state = FadeState::Playing;
+                    self.fade_state = State::Playing;
                 }
                 let t = self.fade_ramp();
                 t * t
             }
-            FadeState::Playing => 1.0,
-            FadeState::FadingOut => {
+            State::Playing => 1.0,
+            State::FadingOut => {
                 if self.fade_pos == 0 {
-                    self.fade_state = FadeState::Done;
+                    self.fade_state = State::Done;
                     0.0
                 } else {
                     self.fade_pos = self.fade_pos.saturating_sub(1);
@@ -1462,10 +457,10 @@ impl AmbientTechno {
                     t * t
                 }
             }
-            FadeState::Done => 0.0,
+            State::Done => 0.0,
         };
 
-        if self.fade_state == FadeState::Done {
+        if self.fade_state == State::Done {
             return (0.0, 0.0);
         }
 
@@ -1718,9 +713,31 @@ impl AmbientTechno {
     }
 }
 
+impl Track for AmbientTechno {
+    fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let len = left.len().min(right.len());
+        for i in 0..len {
+            let (l, r) = self.next_sample();
+            left[i] = l;
+            right[i] = r;
+        }
+    }
+
+    fn start_fade_out(&mut self) {
+        if self.fade_state == State::FadingIn || self.fade_state == State::Playing {
+            self.fade_state = State::FadingOut;
+        }
+    }
+
+    fn state(&self) -> State {
+        self.fade_state
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instruments::GranularEngine;
 
     #[test]
     fn pulse_oscillator_fires_at_correct_rate() {
