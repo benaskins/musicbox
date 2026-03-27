@@ -3,7 +3,7 @@ use rand::SeedableRng;
 
 use crate::effects::{BbdDelay, DattorroReverb, DubDelay, Phaser, ResonantLpf};
 use crate::instruments::{ClaveVoice, DubStab, HiHat, Kick, MonoSynth, Snare808, SynthPad};
-use crate::clocks::{PulseOscillator, SwingLfo};
+use crate::clocks::{Clock, PulseOscillator, TimeSignature};
 use crate::util::prng::Xorshift64;
 use crate::track::{State, Track};
 
@@ -139,6 +139,10 @@ const FADE_DURATION: f32 = 1.0;
 /// Human resting heartbeat — the base frequency from which all rhythms derive.
 const BASE_FREQ: f32 = 1.2;
 
+/// Swing ratio used for off-beat 16th/8th positions (~triplet shuffle).
+/// Produces an offset of beat_duration / 12 — the maximum of the old SwingLfo range.
+fn swing_offset(beat_duration: u32) -> u32 { beat_duration / 12 }
+
 /// Polyrhythmic ratios (p/q of base frequency).
 /// Chosen so LCM of denominators creates long resolution period.
 const RIM_RATIO: (f32, f32) = (9.0, 5.0);    // 9/5 base → 2.160 Hz — drifts against kick
@@ -162,8 +166,8 @@ const RIM_RATIO: (f32, f32) = (9.0, 5.0);    // 9/5 base → 2.160 Hz — drifts
 /// Full alignment: LCM(4, 5, 7) = 140 base cycles ≈ 116.7s ≈ ~2 minutes
 /// ```
 pub struct AmbientTechno {
+    clock: Clock,
     kick: Kick,
-    kick_pulse: PulseOscillator,
     kick_timer: Option<u32>,
     ghost_kick: Kick,
     beat_count: u32,
@@ -175,10 +179,6 @@ pub struct AmbientTechno {
     hat_phaser: Phaser,
     beat_phase: u32,
     beat_duration: u32,
-    swing: SwingLfo,
-    /// Pre-computed trigger positions (in samples from kick) for the current beat, accounting for swing.
-    open_hat_position: u32,
-    closed_hat_positions: [u32; 3],
     roll_active: bool,
     snare: Snare808,
     snare_timer: Option<u32>,
@@ -246,9 +246,10 @@ impl AmbientTechno {
         let sr = sample_rate as f32;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
+        let beat_duration = (sr / BASE_FREQ) as u32;
         let mut engine = Self {
+            clock: Clock::new(BASE_FREQ * 60.0, TimeSignature::four_four(), 0.67, sr),
             kick: Kick::new(sr),
-            kick_pulse: PulseOscillator::new(BASE_FREQ, sr),
             kick_timer: None,
             ghost_kick: Kick::new_ghost(sr),
             beat_count: 0,
@@ -259,10 +260,7 @@ impl AmbientTechno {
             closed_hat_lpf: ResonantLpf::new(3000.0, 6000.0, 0.2, 0.1, sr, &mut rng),
             hat_phaser: Phaser::new(0.7, 0.3, 0.25, sr),
             beat_phase: 0,
-            beat_duration: (sr / BASE_FREQ) as u32,
-            swing: SwingLfo::new(),
-            open_hat_position: (sr / BASE_FREQ) as u32 / 2,
-            closed_hat_positions: [0; 3],
+            beat_duration,
             roll_active: false,
             snare: Snare808::new(sr, rng.r#gen::<u64>() | 1),
             snare_timer: None,
@@ -464,11 +462,11 @@ impl AmbientTechno {
             return (0.0, 0.0);
         }
 
-        if self.kick_pulse.tick() {
+        let ticks = self.clock.tick();
+
+        if ticks.quarter {
             self.beat_phase = 0;
-            // Advance the swing LFO and recompute all trigger positions (including the kick itself).
-            self.swing.advance();
-            let sw = self.swing.offset_samples(self.beat_duration);
+            let sw = swing_offset(self.beat_duration);
 
             // Every 8 bars (32 beats): re-evaluate which patterns are active.
             if self.beat_count % 32 == 0 {
@@ -484,9 +482,6 @@ impl AmbientTechno {
             if self.patterns[PATTERN_BASSLINE].active {
                 self.bassline_downbeat_timer = Some(sw);
             }
-            let sixteenth = self.beat_duration / 4;
-            self.open_hat_position = self.beat_duration / 2 + sw;
-            self.closed_hat_positions = [sixteenth + sw, sixteenth * 2, sixteenth * 3 + sw];
             self.roll_active = self.patterns[PATTERN_HATS].active && self.beat_count % 8 == 7;
             if self.beat_count % 8 == 0 && self.patterns[PATTERN_PAD].active {
                 // Every 8 beats: pick a new high pentatonic note for the pad
@@ -591,14 +586,17 @@ impl AmbientTechno {
             self.ghost_snare.trigger_ghost();
         });
 
-        // Open hat is phase-locked to kick: fires at the swung halfway point of each beat (off-beat).
-        if self.patterns[PATTERN_HATS].active && self.beat_phase == self.open_hat_position {
+        // Open hat fires at the swung off-beat 8th note position.
+        let sw = swing_offset(self.beat_duration);
+        let sixteenth = self.beat_duration / 4;
+        if self.patterns[PATTERN_HATS].active && self.beat_phase == self.beat_duration / 2 + sw {
             self.hat.trigger();
         }
 
-        let at_closed_hat_pos = self.beat_phase == self.closed_hat_positions[0]
-            || self.beat_phase == self.closed_hat_positions[1]
-            || self.beat_phase == self.closed_hat_positions[2];
+        // Closed hats fire at swung 16th positions (1st, 3rd) and straight 8th (2nd).
+        let at_closed_hat_pos = self.beat_phase == sixteenth + sw
+            || self.beat_phase == sixteenth * 2
+            || self.beat_phase == sixteenth * 3 + sw;
 
         // Closed hats are phase-locked to the kick: fire at swung 16th note positions.
         if self.patterns[PATTERN_HATS].active && at_closed_hat_pos {
@@ -615,9 +613,9 @@ impl AmbientTechno {
         if self.patterns[PATTERN_BASSLINE].active {
             let base = ((self.beat_count.wrapping_sub(1)) % 8 * 4) as usize;
             let step_offset =
-                if self.beat_phase == self.closed_hat_positions[0] { Some(1) }
-                else if self.beat_phase == self.closed_hat_positions[1] { Some(2) }
-                else if self.beat_phase == self.closed_hat_positions[2] { Some(3) }
+                if self.beat_phase == sixteenth + sw { Some(1) }
+                else if self.beat_phase == sixteenth * 2 { Some(2) }
+                else if self.beat_phase == sixteenth * 3 + sw { Some(3) }
                 else { None };
             if let Some(off) = step_offset {
                 if let Some(freq) = BASSLINE_PATTERN[base + off] {
@@ -630,7 +628,6 @@ impl AmbientTechno {
         // Odd-indexed hits (off-beat 32nd notes) are nudged by the current swing offset.
         if self.roll_active {
             let spacing = self.beat_duration / 8; // 32nd-note spacing
-            let sw = self.swing.offset_samples(self.beat_duration);
             for i in 0..8u32 {
                 let pos = spacing * i + if i % 2 == 1 { sw } else { 0 };
                 if self.beat_phase == pos {
