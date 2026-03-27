@@ -686,7 +686,7 @@ impl AmbientTechno {
         let (rev_rev_l, rev_rev_r) = self.rev_rev_reverb.process(rev_rev_input);
         let hat = self.hat.next_sample();
         let closed_hat = self.closed_hat_lpf.process(self.closed_hat.next_sample());
-        let (hat_l, hat_r) = self.hat_phaser.process(hat + closed_hat);
+        let (hat_l, hat_r) = self.hat_phaser.process(hat + closed_hat * 1.7);
         let rim_dry = self.rim.next_sample();
         let rim_echoed = self.rim_delay.process(rim_dry);
         let (rim_l, rim_r) = self.rim_reverb.process(rim_echoed);
