@@ -29,11 +29,22 @@ Renders a 32-bit float stereo WAV. Duration examples: `10m`, `1h30m`, `90s`, `5m
 
 ## What you'll hear
 
+### Drone (default)
+
 - **Bass:** Sine drones fading in and out across A minor pentatonic
 - **Mids:** Oscillator layers through a sweeping resonant low-pass filter
 - **High-mids:** Plucked notes through a BBD (bucket brigade) delay
 - **Highs:** Oscillators through a Dattorro plate reverb (ported from [Mutable Instruments Clouds](https://github.com/pichenettes/eurorack/blob/master/clouds/dsp/fx/reverb.h))
 - **Master:** Peak limiter, 3-second fade-in/out
+
+### Ambient Techno (`techno`)
+
+- **Rhythm:** TR-808-style kick, snare with ghost hits, open and closed hi-hats with swing
+- **Harmony:** Dub stabs (detuned saw/triangle chords through decaying filter) and a synth pad
+- **Bass:** Monophonic sawtooth with portamento, sequenced across A minor pentatonic
+- **Texture:** Sparse granular engine (shimmer highs + sub rumble) through plate reverb
+- **Space:** BBD delay on plucks, dub delay on clave, per-voice reverb throughout
+- **Master:** Peak limiter, 1-second fade-in/out
 
 ## Run in the browser
 
