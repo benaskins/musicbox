@@ -59,14 +59,14 @@ impl MonoSynth {
     /// Bass variant: lower cutoff, lower resonance, longer decay — thick and rounded.
     pub fn new_bass(sample_rate: f32) -> Self {
         Self {
-            amp_attack_rate: 0.6 / (sample_rate * 0.025_f32), // ~25ms attack
-            amp_decay: (-1.0 / (sample_rate * 0.12_f32)).exp(), // ~120ms note decay
+            amp_attack_rate: 0.6 / (sample_rate * 0.015_f32), // ~15ms attack (softer, more rounded)
+            amp_decay: (-1.0 / (sample_rate * 0.45_f32)).exp(), // ~450ms note decay (longer sustain)
             filter_env_decay: (-1.0 / (sample_rate * 0.08_f32)).exp(), // ~80ms filter sweep
             cutoff_min: 120.0,
             cutoff_sweep_range: 120.0, // 120–240 Hz
             cutoff_peak: 300.0,
             resonance: 0.25,
-            portamento: 0.001,
+            portamento: 0.0005, // slower glide — slouchy
             ..Self::new(sample_rate)
         }
     }
