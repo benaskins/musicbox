@@ -55,6 +55,23 @@ const SIGIL_STYLE = {
   bass:  { fill: true },
 };
 
+const COLORS = [
+  { id: 'haze',  label: 'HAZE',  mod: 'haze'  },
+  { id: 'drift', label: 'DRIFT', mod: 'drift' },
+  { id: 'sweep', label: 'SWEEP', mod: 'sweep' },
+  { id: 'echo',  label: 'ECHO',  mod: 'echo'  },
+  { id: 'fade',  label: 'FADE',  mod: 'fade'  },
+];
+
+// Color stone SVG shapes — concentric rings / wave motifs
+const COLOR_PATHS = {
+  haze:  'M14 6 A8 8 0 1 0 14 22 A8 8 0 1 0 14 6 M14 10 A4 4 0 1 0 14 18 A4 4 0 1 0 14 10',
+  drift: 'M4 14 Q9 8 14 14 Q19 20 24 14',
+  sweep: 'M4 20 Q8 4 14 14 Q20 24 24 8',
+  echo:  'M8 14 A6 6 0 1 0 8 14.01 M4 14 A10 10 0 1 0 4 14.01 M1 14 A13 13 0 1 0 1 14.01',
+  fade:  'M4 14 L8 8 L12 14 L16 8 L20 14 L24 8',
+};
+
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const POND_RADIUS = 54;
 const POND_GAP = 16;
@@ -74,8 +91,9 @@ function getPondCenter(index) {
   };
 }
 
-let placements = {};   // voiceId -> { pondIndex }
-let ripples = {};      // pondIndex -> [{ phase, birth }]
+let placements = {};       // voiceId -> { pondIndex }
+let colorPlacements = {};  // colorId -> { pondIndex }
+let ripples = {};          // pondIndex -> [{ phase, birth }]
 let animId = null;
 
 function initGroovebox() {
@@ -85,8 +103,8 @@ function initGroovebox() {
 
   const svg = document.createElementNS(SVG_NS, 'svg');
   svg.setAttribute('width', '700');
-  svg.setAttribute('height', '340');
-  svg.setAttribute('viewBox', '0 0 700 340');
+  svg.setAttribute('height', '390');
+  svg.setAttribute('viewBox', '0 0 700 390');
   svg.style.touchAction = 'none';
   svg.style.maxWidth = '100%';
   container.appendChild(svg);
@@ -171,34 +189,81 @@ function initGroovebox() {
     g.appendChild(lbl);
     svg.appendChild(g);
 
-    setupDrag(g, svg);
+    setupDrag(g, svg, 'voice');
+  });
+
+  // Create color stones in dock
+  COLORS.forEach((color, i) => {
+    const g = document.createElementNS(SVG_NS, 'g');
+    g.classList.add('sigil-color');
+    g.dataset.colorId = color.id;
+    g.style.cursor = 'grab';
+
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', COLOR_PATHS[color.id]);
+    path.setAttribute('fill', 'none');
+    path.setAttribute('stroke', 'var(--muted)');
+    path.setAttribute('stroke-width', '1.2');
+    path.setAttribute('stroke-linecap', 'round');
+    path.setAttribute('stroke-linejoin', 'round');
+    path.setAttribute('stroke-dasharray', '3 2');
+
+    const lbl = document.createElementNS(SVG_NS, 'text');
+    lbl.setAttribute('x', SIGIL_SIZE / 2);
+    lbl.setAttribute('y', SIGIL_SIZE + 10);
+    lbl.setAttribute('text-anchor', 'middle');
+    lbl.setAttribute('fill', 'var(--muted)');
+    lbl.setAttribute('font-size', '6');
+    lbl.setAttribute('font-family', "'DM Sans', sans-serif");
+    lbl.setAttribute('letter-spacing', '0.12em');
+    lbl.textContent = color.label;
+
+    g.appendChild(path);
+    g.appendChild(lbl);
+    svg.appendChild(g);
+
+    setupDrag(g, svg, 'color');
   });
 
   positionDock(svg);
 }
 
-function getDockPosition(index) {
-  const cols = 11;
-  const col = index % cols;
-  const totalW = cols * 48;
-  const startX = (700 - totalW) / 2 + 24;
-  return {
-    x: startX + col * 48,
-    y: 280,
-  };
+function getDockPosition(index, row) {
+  if (row === 0) {
+    // Voice stones: 11 in a row
+    const cols = 11;
+    const col = index % cols;
+    const totalW = cols * 48;
+    const startX = (700 - totalW) / 2 + 24;
+    return { x: startX + col * 48, y: 270 };
+  } else {
+    // Color stones: 5 centered
+    const cols = 5;
+    const col = index % cols;
+    const totalW = cols * 64;
+    const startX = (700 - totalW) / 2 + 32;
+    return { x: startX + col * 64, y: 330 };
+  }
 }
 
 function positionDock(svg) {
   svg.querySelectorAll('.sigil-voice').forEach((g, i) => {
     const voiceId = g.dataset.voiceId;
     if (!placements[voiceId]) {
-      const pos = getDockPosition(i);
+      const pos = getDockPosition(i, 0);
+      g.setAttribute('transform', `translate(${pos.x - SIGIL_SIZE/2}, ${pos.y - SIGIL_SIZE/2})`);
+    }
+  });
+  svg.querySelectorAll('.sigil-color').forEach((g, i) => {
+    const colorId = g.dataset.colorId;
+    if (!colorPlacements[colorId]) {
+      const pos = getDockPosition(i, 1);
       g.setAttribute('transform', `translate(${pos.x - SIGIL_SIZE/2}, ${pos.y - SIGIL_SIZE/2})`);
     }
   });
 }
 
-function setupDrag(g, svg) {
+function setupDrag(g, svg, stoneType) {
   let dragging = false;
   let offsetX = 0, offsetY = 0;
   let currentX = 0, currentY = 0;
@@ -236,16 +301,9 @@ function setupDrag(g, svg) {
     g.setAttribute('transform', `translate(${currentX}, ${currentY})`);
   }
 
-  function onUp() {
-    if (!dragging) return;
-    dragging = false;
-    g.style.cursor = 'grab';
-
-    const voiceId = g.dataset.voiceId;
+  function findDropPond() {
     const cx = currentX + SIGIL_SIZE / 2;
     const cy = currentY + SIGIL_SIZE / 2;
-
-    // Find which pond we're inside
     let droppedPond = -1;
     PONDS.forEach((_, i) => {
       const pc = getPondCenter(i);
@@ -254,28 +312,58 @@ function setupDrag(g, svg) {
         droppedPond = i;
       }
     });
+    return droppedPond;
+  }
 
-    if (droppedPond >= 0) {
-      // Re-layout the old pond if moving between ponds
-      const oldPond = placements[voiceId]?.pondIndex;
-      placements[voiceId] = { pondIndex: droppedPond };
-      if (oldPond !== undefined && oldPond !== droppedPond) {
-        layoutPondStones(svg, oldPond);
+  function onUp() {
+    if (!dragging) return;
+    dragging = false;
+    g.style.cursor = 'grab';
+
+    const droppedPond = findDropPond();
+
+    if (stoneType === 'voice') {
+      const voiceId = g.dataset.voiceId;
+      if (droppedPond >= 0) {
+        const oldPond = placements[voiceId]?.pondIndex;
+        placements[voiceId] = { pondIndex: droppedPond };
+        if (oldPond !== undefined && oldPond !== droppedPond) {
+          layoutPondStones(svg, oldPond);
+        }
+        layoutPondStones(svg, droppedPond);
+        onVoiceActivated(voiceId, droppedPond);
+      } else {
+        const oldPond = placements[voiceId]?.pondIndex;
+        delete placements[voiceId];
+        if (oldPond !== undefined) {
+          layoutPondStones(svg, oldPond);
+        }
+        const idx = VOICES.findIndex(v => v.id === voiceId);
+        const pos = getDockPosition(idx, 0);
+        g.setAttribute('transform', `translate(${pos.x - SIGIL_SIZE/2}, ${pos.y - SIGIL_SIZE/2})`);
+        onVoiceDeactivated(voiceId);
       }
-      layoutPondStones(svg, droppedPond);
-      onVoiceActivated(voiceId, droppedPond);
     } else {
-      // Return to dock
-      const oldPond = placements[voiceId]?.pondIndex;
-      delete placements[voiceId];
-      // Re-layout the pond it was in
-      if (oldPond !== undefined) {
-        layoutPondStones(svg, oldPond);
+      const colorId = g.dataset.colorId;
+      if (droppedPond >= 0) {
+        const oldPond = colorPlacements[colorId]?.pondIndex;
+        colorPlacements[colorId] = { pondIndex: droppedPond };
+        if (oldPond !== undefined && oldPond !== droppedPond) {
+          layoutPondStones(svg, oldPond);
+        }
+        layoutPondStones(svg, droppedPond);
+        onColorActivated(colorId, droppedPond);
+      } else {
+        const oldPond = colorPlacements[colorId]?.pondIndex;
+        delete colorPlacements[colorId];
+        if (oldPond !== undefined) {
+          layoutPondStones(svg, oldPond);
+        }
+        const idx = COLORS.findIndex(c => c.id === colorId);
+        const pos = getDockPosition(idx, 1);
+        g.setAttribute('transform', `translate(${pos.x - SIGIL_SIZE/2}, ${pos.y - SIGIL_SIZE/2})`);
+        onColorDeactivated(colorId, oldPond);
       }
-      const idx = VOICES.findIndex(v => v.id === voiceId);
-      const pos = getDockPosition(idx);
-      g.setAttribute('transform', `translate(${pos.x - SIGIL_SIZE/2}, ${pos.y - SIGIL_SIZE/2})`);
-      onVoiceDeactivated(voiceId);
     }
   }
 
@@ -285,27 +373,32 @@ function setupDrag(g, svg) {
   g.addEventListener('pointercancel', onUp);
 }
 
-// Arrange stones inside a pond — clustered gently around center
+// Arrange all stones (voice + color) inside a pond
 function layoutPondStones(svg, pondIndex) {
   const pc = getPondCenter(pondIndex);
-  const stones = Object.entries(placements)
+
+  // Gather all stones in this pond
+  const allStones = [];
+  Object.entries(placements)
     .filter(([_, p]) => p.pondIndex === pondIndex)
-    .map(([id]) => id);
+    .forEach(([id]) => allStones.push({ id, type: 'voice', selector: `[data-voice-id="${id}"]` }));
+  Object.entries(colorPlacements)
+    .filter(([_, p]) => p.pondIndex === pondIndex)
+    .forEach(([id]) => allStones.push({ id, type: 'color', selector: `[data-color-id="${id}"]` }));
 
-  if (stones.length === 0) return;
+  if (allStones.length === 0) return;
 
-  // Place stones in a gentle spiral from center
-  stones.forEach((voiceId, i) => {
-    const g = svg.querySelector(`[data-voice-id="${voiceId}"]`);
+  allStones.forEach((stone, i) => {
+    const g = svg.querySelector(stone.selector);
     if (!g) return;
 
     let sx, sy;
-    if (stones.length === 1) {
+    if (allStones.length === 1) {
       sx = pc.x;
       sy = pc.y;
     } else {
-      const angle = (i / stones.length) * 2 * Math.PI - Math.PI / 2;
-      const spread = Math.min(12 + stones.length * 4, POND_RADIUS - SIGIL_SIZE/2 - 4);
+      const angle = (i / allStones.length) * 2 * Math.PI - Math.PI / 2;
+      const spread = Math.min(12 + allStones.length * 4, POND_RADIUS - SIGIL_SIZE/2 - 4);
       sx = pc.x + spread * Math.cos(angle);
       sy = pc.y + spread * Math.sin(angle);
     }
@@ -323,6 +416,18 @@ function onVoiceActivated(voiceId, pondIndex) {
 function onVoiceDeactivated(voiceId) {
   if (typeof window.grooveboxOnVoice === 'function') {
     window.grooveboxOnVoice(voiceId, false, -1);
+  }
+}
+
+function onColorActivated(colorId, pondIndex) {
+  if (typeof window.grooveboxOnColor === 'function') {
+    window.grooveboxOnColor(colorId, pondIndex, true);
+  }
+}
+
+function onColorDeactivated(colorId, oldPondIndex) {
+  if (typeof window.grooveboxOnColor === 'function') {
+    window.grooveboxOnColor(colorId, oldPondIndex, false);
   }
 }
 
@@ -405,7 +510,9 @@ window.groovebox = {
   startAnimation,
   stopAnimation,
   getPlacements: () => placements,
+  getColorPlacements: () => colorPlacements,
   VOICES,
+  COLORS,
 };
 
 })();

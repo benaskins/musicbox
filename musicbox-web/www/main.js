@@ -62,6 +62,17 @@ window.grooveboxOnVoice = function(voiceId, active, pondIndex) {
     }
 };
 
+// ── Groovebox color stone activation ──
+window.grooveboxOnColor = function(colorId, pondIndex, active) {
+    if (!workletNode || currentEngine !== "ambient-techno") return;
+    if (pondIndex < 0) return;
+    const paramName = `pond_${pondIndex}_${colorId}`;
+    workletNode.port.postMessage({
+        type: "set-param",
+        data: { name: paramName, value: active ? 1.0 : 0.0 },
+    });
+};
+
 // ── Dot animation along circle arc ──
 const CX = 120, CY = 120, CR = 100;
 const TARGET_ANGLE = Math.PI / 2; // bottom of circle (SVG y-down)
