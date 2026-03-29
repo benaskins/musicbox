@@ -334,3 +334,247 @@ impl ClaveVoice {
         out
     }
 }
+
+// ── TR-727-style shakers ───────────────────────────────────────────────────────
+
+/// TR-727-style cabasa: band-passed noise with a grainy metallic rattle character.
+///
+/// Mid-frequency focus (~4 kHz) with a tighter Q than the maracas, giving the
+/// characteristic metallic bead-scraping sound.
+pub struct Cabasa {
+    noise: Xorshift64,
+    pub amp: f32,
+    peak_amp: f32,
+    attack_inc: f32,
+    decay: f32,
+    is_attacking: bool,
+    bp_low: f32,
+    bp_band: f32,
+    sample_rate: f32,
+}
+
+impl Cabasa {
+    pub fn new(sample_rate: f32, seed: u64) -> Self {
+        let peak_amp = 0.12_f32;
+        Self {
+            noise: Xorshift64::new(seed),
+            amp: 0.0,
+            peak_amp,
+            attack_inc: peak_amp / (sample_rate * 0.020), // ~20ms linear attack
+            decay: (-1.0 / (sample_rate * 0.04_f32)).exp(), // ~40ms decay
+            is_attacking: false,
+            bp_low: 0.0,
+            bp_band: 0.0,
+            sample_rate,
+        }
+    }
+
+    pub fn trigger(&mut self) {
+        self.amp = 0.0;
+        self.is_attacking = true;
+    }
+
+    pub fn next_sample(&mut self) -> f32 {
+        if !self.is_attacking && self.amp < 0.0001 {
+            self.amp = 0.0;
+            return 0.0;
+        }
+        // Grain product noise: spiky distribution approximates bead impacts
+        let grain = self.noise.white() * self.noise.white() * 3.5;
+        // Bandpass at ~5.5 kHz: metallic bead-scraping character
+        let f = (std::f32::consts::PI * 5500.0 / self.sample_rate).sin() * 2.0;
+        let high = grain - self.bp_low - 0.55 * self.bp_band;
+        self.bp_band += f * high;
+        self.bp_low += f * self.bp_band;
+        if self.is_attacking {
+            self.amp += self.attack_inc;
+            if self.amp >= self.peak_amp {
+                self.amp = self.peak_amp;
+                self.is_attacking = false;
+            }
+        } else {
+            self.amp *= self.decay;
+        }
+        self.bp_band * self.amp
+    }
+}
+
+/// TR-727-style maracas: grain product noise through a bandpass, shorter and brighter
+/// than the cabasa. Same synthesis approach, tuned higher and with tighter timing.
+pub struct Maracas {
+    noise: Xorshift64,
+    pub amp: f32,
+    peak_amp: f32,
+    attack_target: f32,
+    attack_inc: f32,
+    decay: f32,
+    is_attacking: bool,
+    bp_low: f32,
+    bp_band: f32,
+    sample_rate: f32,
+}
+
+impl Maracas {
+    pub fn new(sample_rate: f32, seed: u64) -> Self {
+        let peak_amp = 0.22_f32;
+        Self {
+            noise: Xorshift64::new(seed),
+            amp: 0.0,
+            peak_amp,
+            attack_target: peak_amp,
+            attack_inc: peak_amp / (sample_rate * 0.010), // ~10ms linear attack
+            decay: (-1.0 / (sample_rate * 0.015_f32)).exp(), // ~15ms decay
+            is_attacking: false,
+            bp_low: 0.0,
+            bp_band: 0.0,
+            sample_rate,
+        }
+    }
+
+    pub fn trigger(&mut self) {
+        self.attack_target = self.peak_amp;
+        self.amp = 0.0;
+        self.is_attacking = true;
+    }
+
+    pub fn trigger_soft(&mut self, gain: f32) {
+        self.attack_target = self.peak_amp * gain;
+        self.amp = 0.0;
+        self.is_attacking = true;
+    }
+
+    pub fn next_sample(&mut self) -> f32 {
+        if !self.is_attacking && self.amp < 0.0001 {
+            self.amp = 0.0;
+            return 0.0;
+        }
+        // Grain product noise: spiky distribution approximates bead impacts
+        let grain = self.noise.white() * self.noise.white() * 3.5;
+        // Bandpass at ~6.0 kHz: higher and airier than the cabasa
+        let f = (std::f32::consts::PI * 6000.0 / self.sample_rate).sin() * 2.0;
+        let high = grain - self.bp_low - 0.55 * self.bp_band;
+        self.bp_band += f * high;
+        self.bp_low += f * self.bp_band;
+        if self.is_attacking {
+            self.amp += self.attack_inc;
+            if self.amp >= self.attack_target {
+                self.amp = self.attack_target;
+                self.is_attacking = false;
+            }
+        } else {
+            self.amp *= self.decay;
+        }
+        self.bp_band * self.amp
+    }
+}
+
+/// TR-808-style clap. White noise through a 1 kHz bandpass, split into two
+/// parallel amplitude paths:
+///
+/// - **Snap path**: a chain of 3 × 10ms + 1 × 20ms linear sawtooth envelopes,
+///   simulating the crack of multiple hands. This is the snappy "attack" component.
+/// - **Reverb path**: a single smooth exponential decay (~100ms by default),
+///   simulating the ring-out after the snap.
+///
+/// `decay_ms` controls the reverb tail and is randomised ±20% per trigger.
+/// Use `trigger(1.0)` for accented hits and `trigger(0.3)` for ghost hits.
+pub struct Clap {
+    noise: Xorshift64,
+    pub decay_ms: f32,
+    // Bandpass filter state (1000 Hz)
+    bp_low: f32,
+    bp_band: f32,
+    // Snap path: linear sawtooth envelope chain (3×10ms + 1×20ms)
+    snap_amp: f32,
+    snap_cycle: u8,     // 0=idle, 1-3=10ms cycles, 4=20ms final, 5=done
+    snap_dec: f32,      // linear decrement per sample for the current cycle
+    snap_peak: f32,     // peak amplitude set at trigger
+    // Reverb path: smooth exponential decay
+    reverb_amp: f32,
+    reverb_decay: f32,
+    sample_rate: f32,
+}
+
+impl Clap {
+    /// `decay_ms` — reverb tail length (e.g. 60 = tight, 120 = loose).
+    pub fn new(sample_rate: f32, decay_ms: f32, seed: u64) -> Self {
+        Self {
+            noise: Xorshift64::new(seed),
+            decay_ms,
+            bp_low: 0.0,
+            bp_band: 0.0,
+            snap_amp: 0.0,
+            snap_cycle: 0,
+            snap_dec: 0.0,
+            snap_peak: 0.0,
+            reverb_amp: 0.0,
+            reverb_decay: 1.0,
+            sample_rate,
+        }
+    }
+
+    pub fn set_decay_ms(&mut self, decay_ms: f32) {
+        self.decay_ms = decay_ms;
+    }
+
+    /// `gain` — peak amplitude (1.0 = accented, 0.3 = ghost).
+    pub fn trigger(&mut self, gain: f32) {
+        // ±50% random reverb decay variation — gives a range of snappy to loose feels
+        let variation = 1.0 + self.noise.white() * 0.5;
+        let ms = (self.decay_ms * variation).max(1.0);
+        self.reverb_decay = (-1.0 / (self.sample_rate * ms * 0.001)).exp();
+
+        // Snap path: start first 10ms sawtooth immediately
+        self.snap_peak = gain;
+        self.snap_amp = gain;
+        self.snap_cycle = 1;
+        self.snap_dec = gain / (0.010 * self.sample_rate);
+
+        // Reverb path: randomised contribution 0.2–0.9 of snap gain
+        let reverb_level = 0.55 + self.noise.white() * 0.35; // 0.2–0.9
+        self.reverb_amp = gain * reverb_level;
+    }
+
+    pub fn next_sample(&mut self) -> f32 {
+        if self.snap_cycle == 0 && self.reverb_amp < 0.0001 {
+            return 0.0;
+        }
+
+        // Advance snap sawtooth chain
+        if self.snap_cycle > 0 {
+            self.snap_amp -= self.snap_dec;
+            if self.snap_amp <= 0.0 {
+                self.snap_cycle += 1;
+                match self.snap_cycle {
+                    2 | 3 => {
+                        // Another 10ms sawtooth
+                        self.snap_amp = self.snap_peak;
+                        self.snap_dec = self.snap_peak / (0.010 * self.sample_rate);
+                    }
+                    4 => {
+                        // Final 20ms discharge, slightly quieter
+                        self.snap_amp = self.snap_peak * 0.7;
+                        self.snap_dec = self.snap_peak * 0.7 / (0.020 * self.sample_rate);
+                    }
+                    _ => {
+                        self.snap_amp = 0.0;
+                        self.snap_cycle = 0;
+                    }
+                }
+            }
+        }
+
+        // Advance reverb decay
+        self.reverb_amp *= self.reverb_decay;
+        if self.reverb_amp < 0.0001 { self.reverb_amp = 0.0; }
+
+        let noise = self.noise.white();
+        // Bandpass at 1000 Hz, moderate Q
+        let f = (std::f32::consts::PI * 1000.0 / self.sample_rate).sin() * 2.0;
+        let high = noise - self.bp_low - 0.5 * self.bp_band;
+        self.bp_band += f * high;
+        self.bp_low += f * self.bp_band;
+
+        self.bp_band * (self.snap_amp + self.reverb_amp)
+    }
+}
