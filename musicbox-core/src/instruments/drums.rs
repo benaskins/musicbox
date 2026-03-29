@@ -334,3 +334,136 @@ impl ClaveVoice {
         out
     }
 }
+
+// ── TR-727-style shakers ───────────────────────────────────────────────────────
+
+/// TR-727-style cabasa: band-passed noise with a grainy metallic rattle character.
+///
+/// Mid-frequency focus (~4 kHz) with a tighter Q than the maracas, giving the
+/// characteristic metallic bead-scraping sound.
+pub struct Cabasa {
+    noise: Xorshift64,
+    pub amp: f32,
+    peak_amp: f32,
+    attack_inc: f32,
+    decay: f32,
+    is_attacking: bool,
+    bp_low: f32,
+    bp_band: f32,
+    sample_rate: f32,
+}
+
+impl Cabasa {
+    pub fn new(sample_rate: f32, seed: u64) -> Self {
+        let peak_amp = 0.12_f32;
+        Self {
+            noise: Xorshift64::new(seed),
+            amp: 0.0,
+            peak_amp,
+            attack_inc: peak_amp / (sample_rate * 0.020), // ~20ms linear attack
+            decay: (-1.0 / (sample_rate * 0.04_f32)).exp(), // ~40ms decay
+            is_attacking: false,
+            bp_low: 0.0,
+            bp_band: 0.0,
+            sample_rate,
+        }
+    }
+
+    pub fn trigger(&mut self) {
+        self.amp = 0.0;
+        self.is_attacking = true;
+    }
+
+    pub fn next_sample(&mut self) -> f32 {
+        if !self.is_attacking && self.amp < 0.0001 {
+            self.amp = 0.0;
+            return 0.0;
+        }
+        // Grain product noise: spiky distribution approximates bead impacts
+        let grain = self.noise.white() * self.noise.white() * 3.5;
+        // Bandpass at ~5.5 kHz: metallic bead-scraping character
+        let f = (std::f32::consts::PI * 5500.0 / self.sample_rate).sin() * 2.0;
+        let high = grain - self.bp_low - 0.55 * self.bp_band;
+        self.bp_band += f * high;
+        self.bp_low += f * self.bp_band;
+        if self.is_attacking {
+            self.amp += self.attack_inc;
+            if self.amp >= self.peak_amp {
+                self.amp = self.peak_amp;
+                self.is_attacking = false;
+            }
+        } else {
+            self.amp *= self.decay;
+        }
+        self.bp_band * self.amp
+    }
+}
+
+/// TR-727-style maracas: grain product noise through a bandpass, shorter and brighter
+/// than the cabasa. Same synthesis approach, tuned higher and with tighter timing.
+pub struct Maracas {
+    noise: Xorshift64,
+    pub amp: f32,
+    peak_amp: f32,
+    attack_target: f32,
+    attack_inc: f32,
+    decay: f32,
+    is_attacking: bool,
+    bp_low: f32,
+    bp_band: f32,
+    sample_rate: f32,
+}
+
+impl Maracas {
+    pub fn new(sample_rate: f32, seed: u64) -> Self {
+        let peak_amp = 0.22_f32;
+        Self {
+            noise: Xorshift64::new(seed),
+            amp: 0.0,
+            peak_amp,
+            attack_target: peak_amp,
+            attack_inc: peak_amp / (sample_rate * 0.010), // ~10ms linear attack
+            decay: (-1.0 / (sample_rate * 0.015_f32)).exp(), // ~15ms decay
+            is_attacking: false,
+            bp_low: 0.0,
+            bp_band: 0.0,
+            sample_rate,
+        }
+    }
+
+    pub fn trigger(&mut self) {
+        self.attack_target = self.peak_amp;
+        self.amp = 0.0;
+        self.is_attacking = true;
+    }
+
+    pub fn trigger_soft(&mut self, gain: f32) {
+        self.attack_target = self.peak_amp * gain;
+        self.amp = 0.0;
+        self.is_attacking = true;
+    }
+
+    pub fn next_sample(&mut self) -> f32 {
+        if !self.is_attacking && self.amp < 0.0001 {
+            self.amp = 0.0;
+            return 0.0;
+        }
+        // Grain product noise: spiky distribution approximates bead impacts
+        let grain = self.noise.white() * self.noise.white() * 3.5;
+        // Bandpass at ~6.0 kHz: higher and airier than the cabasa
+        let f = (std::f32::consts::PI * 6000.0 / self.sample_rate).sin() * 2.0;
+        let high = grain - self.bp_low - 0.55 * self.bp_band;
+        self.bp_band += f * high;
+        self.bp_low += f * self.bp_band;
+        if self.is_attacking {
+            self.amp += self.attack_inc;
+            if self.amp >= self.attack_target {
+                self.amp = self.attack_target;
+                self.is_attacking = false;
+            }
+        } else {
+            self.amp *= self.decay;
+        }
+        self.bp_band * self.amp
+    }
+}

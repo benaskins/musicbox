@@ -7,7 +7,7 @@ pub mod pluck;
 pub mod stabs;
 
 pub use bass::MonoSynth;
-pub use drums::{ClaveVoice, HiHat, Kick, Snare808};
+pub use drums::{Cabasa, ClaveVoice, HiHat, Kick, Maracas, Snare808};
 pub use granular::{Grain, GranularEngine};
 pub use oscillator::Oscillator;
 pub use pads::SynthPad;
