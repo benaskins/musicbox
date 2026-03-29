@@ -235,6 +235,8 @@ pub struct AmbientTechno {
     bassline_downbeat_timer: Option<u32>,
     patterns: [Pattern; NUM_PATTERNS],
     pattern_rng: Xorshift64,
+    user_active: [bool; NUM_PATTERNS],
+    user_controlled: bool,
     sample_rate: f32,
     limiter_gain: f32,
     fade_pos: u32,
@@ -333,6 +335,8 @@ impl AmbientTechno {
                 Pattern::new(0.1, 0.4, 4, true),    // PATTERN_BASSLINE
             ],
             pattern_rng: Xorshift64::new(rng.r#gen::<u64>() | 1),
+            user_active: [false; NUM_PATTERNS],
+            user_controlled: false,
             sample_rate: sr,
             limiter_gain: 1.0,
             fade_pos: 0,
@@ -429,7 +433,34 @@ impl AmbientTechno {
         self.fade_pos as f32 / self.fade_samples as f32
     }
 
-    pub fn set_param(&mut self, _name: &str, _value: f32) {}
+    fn is_active(&self, pattern: usize) -> bool {
+        if self.user_controlled {
+            self.user_active[pattern]
+        } else {
+            self.patterns[pattern].active
+        }
+    }
+
+    pub fn set_param(&mut self, name: &str, value: f32) {
+        let idx = match name {
+            "kick_mute" => Some(PATTERN_KICK),
+            "snare_mute" => Some(PATTERN_SNARE),
+            "hats_mute" => Some(PATTERN_HATS),
+            "rim_mute" => Some(PATTERN_RIM),
+            "stab1_mute" => Some(PATTERN_STAB1),
+            "stab2_mute" => Some(PATTERN_STAB2),
+            "stab3_mute" => Some(PATTERN_STAB3),
+            "pad_mute" => Some(PATTERN_PAD),
+            "mono_mute" => Some(PATTERN_MONO),
+            "clave_mute" => Some(PATTERN_CLAVE),
+            "bass_mute" => Some(PATTERN_BASSLINE),
+            _ => None,
+        };
+        if let Some(i) = idx {
+            self.user_active[i] = value < 0.5;
+            self.user_controlled = true;
+        }
+    }
 
     pub fn get_params(&self) -> Vec<(&str, f32, f32, f32)> {
         vec![]
@@ -475,41 +506,41 @@ impl AmbientTechno {
             self.closed_hat_timers[2] = Some(sixteenth * 3 + sw);
 
             // Every 8 bars (32 beats): re-evaluate which patterns are active.
-            if self.beat_count % 32 == 0 {
+            if !self.user_controlled && self.beat_count % 32 == 0 {
                 self.update_patterns();
             }
 
-            if self.patterns[PATTERN_KICK].active {
+            if self.is_active(PATTERN_KICK) {
                 self.kick_timer = Some(sw);
             }
-            if self.patterns[PATTERN_MONO].active {
+            if self.is_active(PATTERN_MONO) {
                 self.mono_downbeat_timer = Some(sw);
             }
-            if self.patterns[PATTERN_BASSLINE].active {
+            if self.is_active(PATTERN_BASSLINE) {
                 self.bassline_downbeat_timer = Some(sw);
             }
-            self.roll_active = self.patterns[PATTERN_HATS].active && self.beat_count % 8 == 7;
+            self.roll_active = self.is_active(PATTERN_HATS) && self.beat_count % 8 == 7;
             if self.roll_active {
                 let spacing = beat_duration / 8;
                 for i in 0..8usize {
                     self.roll_timers[i] = Some(spacing * i as u32 + if i % 2 == 1 { sw } else { 0 });
                 }
             }
-            if self.beat_count % 8 == 0 && self.patterns[PATTERN_PAD].active {
+            if self.beat_count % 8 == 0 && self.is_active(PATTERN_PAD) {
                 // Every 8 beats: pick a new high pentatonic note for the pad
                 let idx = (self.pad_rng.next() as usize) % PAD_FREQS.len();
                 self.pad.trigger_minor_chord(PAD_FREQS[idx]);
             }
-            if self.beat_count % 32 == 0 && self.patterns[PATTERN_STAB3].active {
+            if self.beat_count % 32 == 0 && self.is_active(PATTERN_STAB3) {
                 // Every 32nd beat (0, 32, 64…): trigger stab3 on the downbeat
                 let idx = (self.stab_rng.next() as usize) % STAB3_CHORDS.len();
                 self.stab3.trigger_with_chord_and_cutoff(STAB3_CHORDS[idx], 600.0, &mut self.stab_rng);
             }
-            if self.beat_count % 4 == 2 && self.patterns[PATTERN_SNARE].active {
+            if self.beat_count % 4 == 2 && self.is_active(PATTERN_SNARE) {
                 self.snare_timer = Some(sw);
                 self.rev_rev_active = false;
             }
-            if self.beat_count % 4 == 1 && self.patterns[PATTERN_SNARE].active {
+            if self.beat_count % 4 == 1 && self.is_active(PATTERN_SNARE) {
                 self.rev_rev_active = true;
                 self.rev_rev_amp = 0.0;
                 self.rev_rev_rise_rate = 1.0 / beat_duration as f32;
@@ -517,16 +548,16 @@ impl AmbientTechno {
                 self.rev_rev_bp_band = 0.0;
             }
             self.beat_count += 1;
-            if self.beat_count % 2 == 0 && self.patterns[PATTERN_KICK].active {
+            if self.beat_count % 2 == 0 && self.is_active(PATTERN_KICK) {
                 let eighth_note = (self.sample_rate / (BASE_FREQ * 2.0)) as u32;
                 self.ghost_timer = Some(eighth_note + sw);
             }
-            if self.beat_count % 8 == 7 && self.patterns[PATTERN_STAB1].active {
+            if self.beat_count % 8 == 7 && self.is_active(PATTERN_STAB1) {
                 let sixteenth = (self.sample_rate / (BASE_FREQ * 4.0)) as u32;
                 let beat = (self.sample_rate / BASE_FREQ) as u32;
                 self.stab_timer = Some(beat - sixteenth + sw);
             }
-            if self.beat_count % 4 == 3 && self.patterns[PATTERN_STAB2].active {
+            if self.beat_count % 4 == 3 && self.is_active(PATTERN_STAB2) {
                 let sixteenth = (self.sample_rate / (BASE_FREQ * 4.0)) as u32;
                 let beat = (self.sample_rate / BASE_FREQ) as u32;
                 self.stab2_timer = Some(beat - sixteenth + sw);
@@ -534,7 +565,7 @@ impl AmbientTechno {
             // Clave: one hit per 4-bar loop, 1/16th before the 3rd beat of the 4th bar.
             // beat_count % 16 == 14 is the 2nd beat of bar 4 (after increment); fire timer at
             // beat - sixteenth + sw so it lands exactly one 16th note early.
-            if self.beat_count % 16 == 14 && self.patterns[PATTERN_CLAVE].active {
+            if self.beat_count % 16 == 14 && self.is_active(PATTERN_CLAVE) {
                 let sixteenth = (self.sample_rate / (BASE_FREQ * 4.0)) as u32;
                 let beat = (self.sample_rate / BASE_FREQ) as u32;
                 self.clave_timer = Some(beat - sixteenth + sw);
@@ -600,17 +631,17 @@ impl AmbientTechno {
 
         // Open hat fires at beat_duration/2 + sw (7/12 of beat, swung off-beat 8th).
         tick_timer!(self.open_hat_timer, {
-            if self.patterns[PATTERN_HATS].active { self.hat.trigger(); }
+            if self.is_active(PATTERN_HATS) { self.hat.trigger(); }
         });
 
         // Closed hat position 1: swung 1st 16th (sixteenth + sw).
         tick_timer!(self.closed_hat_timers[0], {
-            if self.patterns[PATTERN_HATS].active { self.closed_hat.trigger(); }
-            if self.patterns[PATTERN_MONO].active {
+            if self.is_active(PATTERN_HATS) { self.closed_hat.trigger(); }
+            if self.is_active(PATTERN_MONO) {
                 self.mono.trigger(self.mono_seq_freqs[self.mono_step], self.mono_step % 3 == 0);
                 self.advance_mono_step();
             }
-            if self.patterns[PATTERN_BASSLINE].active {
+            if self.is_active(PATTERN_BASSLINE) {
                 let base = ((self.beat_count.wrapping_sub(1)) % 8 * 4) as usize;
                 if let Some(freq) = BASSLINE_PATTERN[base + 1] { self.bass.trigger(freq, false); }
             }
@@ -618,12 +649,12 @@ impl AmbientTechno {
 
         // Closed hat position 2: straight 8th (sixteenth * 2).
         tick_timer!(self.closed_hat_timers[1], {
-            if self.patterns[PATTERN_HATS].active { self.closed_hat.trigger(); }
-            if self.patterns[PATTERN_MONO].active {
+            if self.is_active(PATTERN_HATS) { self.closed_hat.trigger(); }
+            if self.is_active(PATTERN_MONO) {
                 self.mono.trigger(self.mono_seq_freqs[self.mono_step], self.mono_step % 3 == 0);
                 self.advance_mono_step();
             }
-            if self.patterns[PATTERN_BASSLINE].active {
+            if self.is_active(PATTERN_BASSLINE) {
                 let base = ((self.beat_count.wrapping_sub(1)) % 8 * 4) as usize;
                 if let Some(freq) = BASSLINE_PATTERN[base + 2] { self.bass.trigger(freq, false); }
             }
@@ -631,12 +662,12 @@ impl AmbientTechno {
 
         // Closed hat position 3: swung 3rd 16th (sixteenth * 3 + sw).
         tick_timer!(self.closed_hat_timers[2], {
-            if self.patterns[PATTERN_HATS].active { self.closed_hat.trigger(); }
-            if self.patterns[PATTERN_MONO].active {
+            if self.is_active(PATTERN_HATS) { self.closed_hat.trigger(); }
+            if self.is_active(PATTERN_MONO) {
                 self.mono.trigger(self.mono_seq_freqs[self.mono_step], self.mono_step % 3 == 0);
                 self.advance_mono_step();
             }
-            if self.patterns[PATTERN_BASSLINE].active {
+            if self.is_active(PATTERN_BASSLINE) {
                 let base = ((self.beat_count.wrapping_sub(1)) % 8 * 4) as usize;
                 if let Some(freq) = BASSLINE_PATTERN[base + 3] { self.bass.trigger(freq, false); }
             }
@@ -660,7 +691,7 @@ impl AmbientTechno {
                 self.closed_hat.trigger();
             }
         }
-        if self.patterns[PATTERN_RIM].active && self.rim_pulse.tick() {
+        if self.is_active(PATTERN_RIM) && self.rim_pulse.tick() {
             self.rim.trigger();
         }
 
@@ -941,6 +972,49 @@ mod tests {
             }
         }
         assert!(has_signal, "granular engine should produce signal after spawn");
+    }
+
+    #[test]
+    fn set_param_mute_controls_voice() {
+        let mut engine = AmbientTechno::new(44100, 42);
+        engine.set_param("kick_mute", 0.0); // unmute kick
+        assert!(engine.is_active(PATTERN_KICK), "kick should be active after unmute");
+
+        // All other voices should still be inactive (default in user-controlled mode)
+        assert!(!engine.is_active(PATTERN_SNARE), "snare should be inactive by default");
+        assert!(!engine.is_active(PATTERN_HATS), "hats should be inactive by default");
+
+        // Mute kick again
+        engine.set_param("kick_mute", 1.0);
+        assert!(!engine.is_active(PATTERN_KICK), "kick should be inactive after mute");
+    }
+
+    #[test]
+    fn set_param_unknown_is_noop() {
+        let mut engine = AmbientTechno::new(44100, 42);
+        // Before any valid set_param, is_active reads from auto patterns
+        let kick_before = engine.is_active(PATTERN_KICK);
+        engine.set_param("nonexistent", 1.0);
+        // Should still read from auto patterns (user_controlled not triggered)
+        assert_eq!(engine.is_active(PATTERN_KICK), kick_before,
+            "unknown param should not change active state");
+    }
+
+    #[test]
+    fn user_controlled_skips_auto_patterns() {
+        let mut engine = AmbientTechno::new(44100, 42);
+        engine.set_param("kick_mute", 0.0); // unmute kick, enable user control
+
+        // Render enough to cross several 8-bar boundaries
+        let mut left = vec![0.0f32; 4096];
+        let mut right = vec![0.0f32; 4096];
+        for _ in 0..300 {
+            engine.render(&mut left, &mut right);
+        }
+
+        // User state should be unchanged — auto patterns didn't override
+        assert!(engine.is_active(PATTERN_KICK), "kick should still be active");
+        assert!(!engine.is_active(PATTERN_SNARE), "snare should still be inactive");
     }
 
     #[test]
