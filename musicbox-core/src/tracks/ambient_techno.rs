@@ -86,12 +86,12 @@ const STAB3_CHORDS: [[f32; 3]; 5] = [
 ];
 
 /// Fixed 32-step bassline (8 beats / 2 bars). None = rest.
-/// Repeating Am figure ending with F3 on the last group.
+/// Dubby Am: long–short–short–short–[space]–short–short–short–short–medium. Slouchy and deep.
 const BASSLINE_PATTERN: [Option<f32>; 32] = [
-    Some(110.00), Some(55.00), Some(110.00), Some(130.81), None, Some(82.41), None, None, // beats 1–2
-    Some(110.00), Some(55.00), Some(110.00), Some(130.81), None, Some(82.41), None, None, // beats 3–4
-    Some(110.00), Some(55.00), Some(110.00), Some(130.81), None, Some(82.41), None, None, // beats 5–6
-    Some(110.00), Some(55.00), Some(110.00), Some(130.81), None, Some(61.74), None, None, // beats 7–8 (B2)
+    Some(55.00),  None,        None,        None,        None,        None,        None,        None,        // beat 1–2: long A1
+    Some(73.42),  None,        Some(82.41), Some(55.00), None,        None,        None,        None,        // beat 3–4: short D2, E2, A1 then space
+    None,         None,        None,        None,        Some(55.00), Some(73.42), Some(82.41), Some(55.00), // beat 5–6: space, then short A1 D2 E2 A1
+    Some(41.20),  None,        None,        None,        None,        None,        None,        None,        // beat 7–8: medium E1
 ];
 
 // Pattern indices
