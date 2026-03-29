@@ -45,7 +45,7 @@ knobs.forEach(name => {
 });
 
 // ── Groovebox voice activation ──
-window.grooveboxOnVoice = function(voiceId, active) {
+window.grooveboxOnVoice = function(voiceId, active, pondIndex) {
     if (!workletNode || currentEngine !== "ambient-techno") return;
     const voice = window.groovebox.VOICES.find(v => v.id === voiceId);
     if (!voice) return;
@@ -53,6 +53,13 @@ window.grooveboxOnVoice = function(voiceId, active) {
         type: "set-param",
         data: { name: voice.param, value: active ? 0.0 : 1.0 },
     });
+    if (active && pondIndex >= 0) {
+        const ratioParam = voiceId + "_ratio";
+        workletNode.port.postMessage({
+            type: "set-param",
+            data: { name: ratioParam, value: pondIndex },
+        });
+    }
 };
 
 // ── Dot animation along circle arc ──
@@ -331,6 +338,12 @@ async function start() {
                     type: "set-param",
                     data: { name: voice.param, value: active ? 0.0 : 1.0 },
                 });
+                if (active) {
+                    workletNode.port.postMessage({
+                        type: "set-param",
+                        data: { name: voice.id + "_ratio", value: placements[voice.id].pondIndex },
+                    });
+                }
             });
             window.groovebox.startAnimation();
         }

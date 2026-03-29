@@ -147,6 +147,15 @@ fn swing_offset(beat_duration: u32) -> u32 { beat_duration / 12 }
 /// Chosen so LCM of denominators creates long resolution period.
 const RIM_RATIO: (f32, f32) = (9.0, 5.0);    // 9/5 base → 2.160 Hz — drifts against kick
 
+/// Available ratios for groovebox ratio assignment.
+const RATIOS: [(f32, f32); 5] = [
+    (1.0, 1.0),  // 1/1 → 1.200 Hz
+    (7.0, 4.0),  // 7/4 → 2.100 Hz
+    (3.0, 5.0),  // 3/5 → 0.720 Hz
+    (9.0, 5.0),  // 9/5 → 2.160 Hz
+    (1.0, 7.0),  // 1/7 → 0.171 Hz
+];
+
 /// Polyrhythmic ambient techno engine.
 ///
 /// All timing derived from a single base frequency (human heartbeat, 1.2 Hz).
@@ -237,6 +246,7 @@ pub struct AmbientTechno {
     pattern_rng: Xorshift64,
     user_active: [bool; NUM_PATTERNS],
     user_controlled: bool,
+    voice_pulses: [PulseOscillator; NUM_PATTERNS],
     sample_rate: f32,
     limiter_gain: f32,
     fade_pos: u32,
@@ -337,6 +347,7 @@ impl AmbientTechno {
             pattern_rng: Xorshift64::new(rng.r#gen::<u64>() | 1),
             user_active: [false; NUM_PATTERNS],
             user_controlled: false,
+            voice_pulses: std::array::from_fn(|_| PulseOscillator::new(BASE_FREQ, sr)),
             sample_rate: sr,
             limiter_gain: 1.0,
             fade_pos: 0,
@@ -442,7 +453,8 @@ impl AmbientTechno {
     }
 
     pub fn set_param(&mut self, name: &str, value: f32) {
-        let idx = match name {
+        // Mute params
+        let mute_idx = match name {
             "kick_mute" => Some(PATTERN_KICK),
             "snare_mute" => Some(PATTERN_SNARE),
             "hats_mute" => Some(PATTERN_HATS),
@@ -456,9 +468,31 @@ impl AmbientTechno {
             "bass_mute" => Some(PATTERN_BASSLINE),
             _ => None,
         };
-        if let Some(i) = idx {
+        if let Some(i) = mute_idx {
             self.user_active[i] = value < 0.5;
             self.user_controlled = true;
+            return;
+        }
+
+        // Ratio params
+        let ratio_idx = match name {
+            "kick_ratio" => Some(PATTERN_KICK),
+            "snare_ratio" => Some(PATTERN_SNARE),
+            "hats_ratio" => Some(PATTERN_HATS),
+            "rim_ratio" => Some(PATTERN_RIM),
+            "stab1_ratio" => Some(PATTERN_STAB1),
+            "stab2_ratio" => Some(PATTERN_STAB2),
+            "stab3_ratio" => Some(PATTERN_STAB3),
+            "pad_ratio" => Some(PATTERN_PAD),
+            "mono_ratio" => Some(PATTERN_MONO),
+            "clave_ratio" => Some(PATTERN_CLAVE),
+            "bass_ratio" => Some(PATTERN_BASSLINE),
+            _ => None,
+        };
+        if let Some(i) = ratio_idx {
+            let ri = (value as usize).min(RATIOS.len() - 1);
+            let freq = BASE_FREQ * RATIOS[ri].0 / RATIOS[ri].1;
+            self.voice_pulses[i].set_freq(freq);
         }
     }
 
@@ -497,7 +531,73 @@ impl AmbientTechno {
         let beat_duration = (self.sample_rate / BASE_FREQ) as u32;
         let ticks = self.clock.tick();
 
-        if ticks.quarter {
+        // ── User-controlled mode: each voice triggers from its own PulseOscillator ──
+        if self.user_controlled {
+            for i in 0..NUM_PATTERNS {
+                if !self.user_active[i] { continue; }
+                if !self.voice_pulses[i].tick() { continue; }
+
+                match i {
+                    PATTERN_KICK => {
+                        self.kick.trigger();
+                        self.ghost_kick.trigger_with_amp_and_pitch(0.125, 1.0);
+                    }
+                    PATTERN_SNARE => {
+                        self.snare.trigger();
+                        // Schedule ghost snares
+                        let sixteenth = beat_duration / 4;
+                        self.ghost_snare1_timer = Some(beat_duration);
+                        self.ghost_snare2_timer = Some(beat_duration + sixteenth);
+                    }
+                    PATTERN_HATS => {
+                        self.hat.trigger();
+                        // Schedule closed hats at subdivision offsets
+                        let sixteenth = beat_duration / 4;
+                        let sw = swing_offset(beat_duration);
+                        self.closed_hat_timers[0] = Some(sixteenth + sw);
+                        self.closed_hat_timers[1] = Some(sixteenth * 2);
+                        self.closed_hat_timers[2] = Some(sixteenth * 3 + sw);
+                    }
+                    PATTERN_RIM => {
+                        self.rim.trigger();
+                    }
+                    PATTERN_STAB1 => {
+                        let idx = (self.stab_rng.next() as usize) % STAB1_CHORDS.len();
+                        self.stab.trigger_with_chord(STAB1_CHORDS[idx], &mut self.stab_rng);
+                        self.last_stab_idx = idx;
+                    }
+                    PATTERN_STAB2 => {
+                        self.stab2.trigger_with_chord(STAB2_CHORDS[self.last_stab_idx], &mut self.stab_rng);
+                    }
+                    PATTERN_STAB3 => {
+                        let idx = (self.stab_rng.next() as usize) % STAB3_CHORDS.len();
+                        self.stab3.trigger_with_chord_and_cutoff(STAB3_CHORDS[idx], 600.0, &mut self.stab_rng);
+                    }
+                    PATTERN_PAD => {
+                        let idx = (self.pad_rng.next() as usize) % PAD_FREQS.len();
+                        self.pad.trigger_minor_chord(PAD_FREQS[idx]);
+                    }
+                    PATTERN_MONO => {
+                        self.mono.trigger(self.mono_seq_freqs[self.mono_step], self.mono_step % 3 == 0);
+                        self.advance_mono_step();
+                    }
+                    PATTERN_CLAVE => {
+                        self.clave.trigger_with_note("A6");
+                    }
+                    PATTERN_BASSLINE => {
+                        let step = (self.beat_count % 8 * 4) as usize;
+                        if let Some(freq) = BASSLINE_PATTERN[step] {
+                            self.bass.trigger(freq, false);
+                        }
+                        self.beat_count = self.beat_count.wrapping_add(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // ── Auto mode: clock-driven beat_count scheduling ──
+        if !self.user_controlled && ticks.quarter {
             let sw = swing_offset(beat_duration);
             let sixteenth = beat_duration / 4;
             self.open_hat_timer = Some(beat_duration / 2 + sw);
@@ -691,7 +791,7 @@ impl AmbientTechno {
                 self.closed_hat.trigger();
             }
         }
-        if self.is_active(PATTERN_RIM) && self.rim_pulse.tick() {
+        if !self.user_controlled && self.is_active(PATTERN_RIM) && self.rim_pulse.tick() {
             self.rim.trigger();
         }
 
@@ -751,7 +851,12 @@ impl AmbientTechno {
         let peak = left.abs().max(right.abs());
         if peak * self.limiter_gain > 0.8 {
             let target = 0.8 / peak;
-            self.limiter_gain += 0.002 * (target - self.limiter_gain);
+            // Fast attack: immediately clamp if way over, otherwise smooth
+            if peak * self.limiter_gain > 1.0 {
+                self.limiter_gain = 0.95 / peak;
+            } else {
+                self.limiter_gain += 0.002 * (target - self.limiter_gain);
+            }
         } else {
             self.limiter_gain += 0.0001 * (1.0 - self.limiter_gain);
         }
@@ -1015,6 +1120,58 @@ mod tests {
         // User state should be unchanged — auto patterns didn't override
         assert!(engine.is_active(PATTERN_KICK), "kick should still be active");
         assert!(!engine.is_active(PATTERN_SNARE), "snare should still be inactive");
+    }
+
+    #[test]
+    fn set_param_ratio_changes_voice_pulse_rate() {
+        let sr = 44100;
+        let mut engine = AmbientTechno::new(sr, 42);
+
+        // Unmute kick and assign to ratio index 3 (9/5 = 2.16 Hz)
+        engine.set_param("kick_mute", 0.0);
+        engine.set_param("kick_ratio", 3.0);
+
+        // Render 2 seconds — count kick triggers by looking for signal peaks
+        let mut left = vec![0.0f32; 1024];
+        let mut right = vec![0.0f32; 1024];
+        let blocks = (sr as usize * 2) / 1024;
+        let mut peak_count = 0u32;
+        let mut was_quiet = true;
+        for _ in 0..blocks {
+            engine.render(&mut left, &mut right);
+            for &s in left.iter() {
+                if s.abs() > 0.05 && was_quiet {
+                    peak_count += 1;
+                    was_quiet = false;
+                }
+                if s.abs() < 0.01 {
+                    was_quiet = true;
+                }
+            }
+        }
+
+        // At 2.16 Hz over 2 seconds, expect roughly 4 triggers (give or take)
+        assert!(peak_count >= 2, "expected multiple kick triggers at 9/5 ratio, got {}", peak_count);
+    }
+
+    #[test]
+    fn ratio_assignment_stays_bounded() {
+        let mut engine = AmbientTechno::new(44100, 42);
+        // Unmute all voices and assign various ratios
+        for (i, voice) in ["kick", "snare", "hats", "rim", "stab1", "stab2",
+                           "stab3", "pad", "mono", "clave", "bass"].iter().enumerate() {
+            engine.set_param(&format!("{}_mute", voice), 0.0);
+            engine.set_param(&format!("{}_ratio", voice), (i % 5) as f32);
+        }
+
+        let mut left = vec![0.0f32; 4096];
+        let mut right = vec![0.0f32; 4096];
+        for _ in 0..30 {
+            engine.render(&mut left, &mut right);
+            for &s in left.iter().chain(right.iter()) {
+                assert!(s.abs() <= 1.0, "sample {} exceeds [-1, 1] range", s);
+            }
+        }
     }
 
     #[test]
